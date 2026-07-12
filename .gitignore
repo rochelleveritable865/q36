@@ -1,0 +1,9 @@
+q36
+q36_bench
+q36_server
+q36_ppl
+gguf_dump
+q36_info
+test_dequant
+test_mma_bs
+*.o
