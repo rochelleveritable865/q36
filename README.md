@@ -126,4 +126,4 @@ The full MIT License text and copyright notices for these components are preserv
 
 ## Author
 
-Built by [Ambud Sharma](https://github.com/ambud) — connect with me on [LinkedIn](https://www.linkedin.com/in/ambud/).
+Built by [Ambud Sharma](https://github.com/ambud) — follow me on [LinkedIn](https://www.linkedin.com/in/ambud/).
