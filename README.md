@@ -2,7 +2,7 @@
 
 A hyper-optimized, zero-dependency C/CUDA inference engine for Qwen 3.6 35B on RTX 5090 / Blackwell.
 
-A zero-dependency C/CUDA codebase specialized for a single model + GPU pairing — Qwen3.6-35B-A3B (MXFP4 GGUF) on RTX 5090 (sm_120a) — on the bet that a dedicated engine beats generic runtimes (llama.cpp / vLLM / SGLang) on their long tail. **Status: faster than llama.cpp at every measured point.**
+A zero-dependency C/CUDA codebase specialized for a single model + GPU pairing — Qwen3.6-35B-A3B (MXFP4 GGUF) on RTX 5090 (sm_120a) — on the bet that a dedicated engine beats generic runtimes (llama.cpp / vLLM / SGLang) on their long tail. **Status: faster than llama.cpp on every end-to-end workload and every prefill/decode point except decode at 90k depth.**
 
 ### Key Features
 
@@ -12,6 +12,32 @@ A zero-dependency C/CUDA codebase specialized for a single model + GPU pairing �
 * 💾 **Dual-Tier State Management**: Zero-overhead VRAM saving (**2.5× smaller KV cache** via `--kv-quant`) and DRAM/Disk state checkpoint caching (restoring context states in **3ms**).
 * 🌐 **OpenAI-Compatible Server**: A zero-dependency, prefix-cached HTTP server (`q36_server`) supporting SSE streaming and tool calling.
 * 🛠️ **Developer Tooling**: Built-in benchmark tools (`q36_bench`), perplexity evaluation harnesses (`q36_ppl`), and CPU-only validation helpers.
+
+## Performance vs llama.cpp
+
+```
+prefill t/s                                       q36 ▓   llama.cpp ░
+pp2048    ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  13,665
+          ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  10,836
+pp32768   ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  10,665
+          ░░░░░░░░░░░░░░░░░░░░░░░░░░░  9,400
+pp90112   ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  7,843
+          ░░░░░░░░░░░░░░░░░░░░  7,112
+
+decode t/s at depth
+tg128     ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  294.4
+          ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  280.5
+@ d32768  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  251.5
+          ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  246.2
+@ d90112  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  199.5
+          ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  208.3
+```
+
+Same GGUF, same idle RTX 5090 (400W power limit), back-to-back; llama.cpp
+b9954 with `-fa 1` at its best `-b`/`-ub` setting per test. Greedy decode
+adds a further ~+7% with `--mtp`. Full table, exact commands, and
+end-to-end workload numbers: [ENGINE.md](docs/ENGINE.md#benchmarks-q36_bench-greedy-1-gpu-fp16-kv)
+(the canonical copy of this chart).
 
 ## Quick Start
 
