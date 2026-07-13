@@ -82,6 +82,12 @@ int  q36_engine_prefill_from(q36_engine*e,const int*toks,int n,int pos0);
 void q36_engine_reset(q36_engine*e);
 void q36_engine_set_kvq(q36_engine*e,int on);
 void q36_engine_set_sampler(q36_engine*e,float temp,int topk,float topp,unsigned long long seed);
+/* MTP self-speculative decode (q36_engine.cu); step_mtp falls back to a
+ * plain step near the ctx edge or when the sampler is non-greedy */
+int  q36_engine_step_mtp(q36_engine*e,int token,int pos,int out[4]);
+int  q36_engine_has_mtp(q36_engine*e);
+void q36_engine_set_mtp_k(q36_engine*e,int k);
+void q36_engine_mtp_stats(q36_engine*e,long*cycles,long*accepts);
 /* hybrid state checkpoint primitives (q36_engine.cu) */
 size_t q36_engine_state_ssm_bytes(q36_engine*e);
 size_t q36_engine_state_kv_bytes(q36_engine*e,int npos);
@@ -103,6 +109,10 @@ static int g_autopurge=1;               /* DEFAULT ON: drop oldest turns / left-
 static int g_hide_think=0;              /* --hide-think: never emit the leading
                                            <think> region (tokens still generate;
                                            Qwen3.6 reasons before answering) */
+static int g_mtp=0;                     /* --mtp [K]: self-speculative decode for
+                                           greedy requests (needs the MTP GGUF's
+                                           nextn module; sampled requests fall
+                                           back to the plain step path) */
 static float g_temp=1.0f;               /* --temp: default when the client omits
                                            temperature.  Agent harnesses (Claude
                                            Code) rarely send one; the GGUF's 1.0
@@ -1426,6 +1436,16 @@ static void handle_generate(int fd,const char*body,size_t blen,int proto){
     int pos=nt, gen=0;
     const char*finish="length";
     char tb[64];
+    /* MTP self-speculative decode: greedy requests only (verify is argmax
+     * equality; the engine itself also refuses when the sampler is hot).
+     * step_mtp returns 1..K+1 tokens per call; all but the last are
+     * already fed into the engine, so they are recorded as in-state the
+     * moment they are returned -- even if a stop/EOS lands mid-batch and
+     * they are never emitted.  g_cache_ids must mirror the REAL state or
+     * the next request's prefix-extension check would trust stale KV. */
+    int use_mtp=(g_mtp&&!sampled);
+    int pend[3],npend=0,ip=0;
+    long mc0=0,ma0=0; if(use_mtp) q36_engine_mtp_stats(g_e,&mc0,&ma0);
     /* reasoning-model stop handling: while inside an unclosed LEADING <think>
      * block, user stop strings are suppressed -- thinking routinely quotes
      * the prompt (e.g. gsm8k sends stop "Question:" and the model writes
@@ -1463,9 +1483,23 @@ static void handle_generate(int fd,const char*body,size_t blen,int proto){
         if(stopped) break;
         if(gen>=maxn) break;
         if(r.stream) emit_chunk(&em,NULL);
-        g_cache_ids[g_cache_n++]=cur;        /* about to be fed to the engine */
-        g_kv_ids[pos]=cur; if(g_kv_n<=pos) g_kv_n=pos+1;
-        cur=q36_engine_step(g_e,cur,pos++);
+        if(ip<npend){ cur=pend[ip++]; continue; } /* fed + recorded by step_mtp below */
+        if(use_mtp){
+            g_cache_ids[g_cache_n++]=cur;    /* about to be fed to the engine */
+            g_kv_ids[pos]=cur; if(g_kv_n<=pos) g_kv_n=pos+1;
+            int o4[4],k=q36_engine_step_mtp(g_e,cur,pos,o4);
+            for(int j=0;j+1<k;j++){          /* accepted drafts: fed at pos+1+j */
+                g_cache_ids[g_cache_n++]=o4[j];
+                g_kv_ids[pos+1+j]=o4[j];
+            }
+            pos+=k; if(g_kv_n<pos) g_kv_n=pos;
+            cur=o4[0];
+            npend=k-1; ip=0; for(int j=0;j<npend;j++) pend[j]=o4[j+1];
+        } else {
+            g_cache_ids[g_cache_n++]=cur;    /* about to be fed to the engine */
+            g_kv_ids[pos]=cur; if(g_kv_n<=pos) g_kv_n=pos+1;
+            cur=q36_engine_step(g_e,cur,pos++);
+        }
     }
     double dt=now()-t1;
 
@@ -1571,12 +1605,18 @@ static void handle_generate(int fd,const char*body,size_t blen,int proto){
     }
     g_tok_pf+=(unsigned long long)ext; g_tok_gen+=(unsigned long long)gen;
     g_tok_hit+=(unsigned long long)pos0;
+    char mtps[48]="";
+    if(use_mtp){
+        long mc1,ma1; q36_engine_mtp_stats(g_e,&mc1,&ma1);
+        if(mc1>mc0) snprintf(mtps,sizeof mtps," | mtp accept %.0f%% (%.2f tok/verify)",
+            100.0*(ma1-ma0)/((mc1-mc0)*g_mtp),1.0+(double)(ma1-ma0)/(mc1-mc0));
+    }
     fprintf(stderr,"[%s] prompt %d tok (%d cached) prefill %.0f t/s | gen %d tok %.1f t/s | %s"
-        " | lifetime %.2fM (pf %.2fM + gen %.2fM), cache-hit %.2fM | tc ok %llu bad %llu\n",
+        " | lifetime %.2fM (pf %.2fM + gen %.2fM), cache-hit %.2fM | tc ok %llu bad %llu%s\n",
         proto==PROTO_ANTH?"msg":chat?"chat":"cmpl",
         nt,pos0,ext>0?ext*1000.0/pf_ms:0.0,gen,gen>0?gen/dt:0.0,finish,
         (g_tok_pf+g_tok_gen)/1e6,g_tok_pf/1e6,g_tok_gen/1e6,g_tok_hit/1e6,
-        g_tc_ok,g_tc_bad);
+        g_tc_ok,g_tc_bad,mtps);
     for(int k=0;k<ntc;k++) free(otc[k].args.p);
     free(em.text.p);
     req_free(&r);
@@ -1658,6 +1698,8 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--auto-purge")) g_autopurge=1;   /* back-compat no-op */
         else if(!strcmp(argv[i],"--no-auto-purge")) g_autopurge=0;
         else if(!strcmp(argv[i],"--temp")&&i+1<argc) g_temp=(float)atof(argv[++i]);
+        else if(!strcmp(argv[i],"--mtp")){ g_mtp=1;   /* optional draft depth 1-3 */
+            if(i+1<argc&&argv[i+1][0]>='1'&&argv[i+1][0]<='3'&&!argv[i+1][1]) g_mtp=atoi(argv[++i]); }
         else if(!strcmp(argv[i],"--hide-think")) g_hide_think=1;
         else if(!strcmp(argv[i],"--cache-log")) g_ck_log=1;
         else if(!strcmp(argv[i],"--no-state-cache")) g_ck_on=0;
@@ -1668,6 +1710,9 @@ int main(int argc,char**argv){
         else { fprintf(stderr,"usage: %s [-m gguf] [--port n] [--ctx n] [--kv-quant] [--no-auto-purge]\n"
                       "  [--temp t]      default temperature when the request omits one (default 1.0;\n"
                       "                  0 = greedy/deterministic -- recommended for agent harnesses)\n"
+                      "  [--mtp [K]]     self-speculative decode for greedy requests (needs the MTP\n"
+                      "                  GGUF's nextn module; draft depth K=1..3, default 1; sampled\n"
+                      "                  requests use the plain path; output unchanged, just faster)\n"
                       "  [--hide-think]  suppress <think> output entirely (default: /v1/messages\n"
                       "                  emits it as a thinking content block; OpenAI wire keeps raw text)\n"
                       "  state checkpoint cache:\n"
@@ -1727,8 +1772,14 @@ int main(int argc,char**argv){
             g_ssm_sz/1048576.0,g_kv_psz/1024.0,g_ck_ram>>20,g_ck_min,
             g_ck_dir?" | disk ":"",g_ck_dir?g_ck_dir:"");
     }
-    fprintf(stderr,"engine ready in %.1fs | ctx %d | kv %s | default temp %.2f%s\n",
-            now()-t0,g_ctx,kvq?"q8/mxfp4":"fp16",g_temp,g_temp<=0.f?" (greedy)":"");
+    if(g_mtp&&!q36_engine_has_mtp(g_e)){
+        fprintf(stderr,"--mtp: model has no nextn module (need the MTP GGUF); disabled\n");
+        g_mtp=0;
+    }
+    if(g_mtp) q36_engine_set_mtp_k(g_e,g_mtp);
+    fprintf(stderr,"engine ready in %.1fs | ctx %d | kv %s | default temp %.2f%s%s\n",
+            now()-t0,g_ctx,kvq?"q8/mxfp4":"fp16",g_temp,g_temp<=0.f?" (greedy)":"",
+            g_mtp==1?" | mtp K=1":g_mtp==2?" | mtp K=2":g_mtp==3?" | mtp K=3":"");
 
     int s=socket(AF_INET,SOCK_STREAM,0);
     int one=1; setsockopt(s,SOL_SOCKET,SO_REUSEADDR,&one,sizeof one);

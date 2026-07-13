@@ -119,7 +119,8 @@ make test_mma_bs  # hardware validation of the block-scaled MMA mappings
 
 ```sh
 ./q36 [--ctx 8192] [-n 256] [--temp 1.0 --top-k 20 --top-p 0.95 --seed 42]
-         [--kv-quant] [--gpus N] [-m model.gguf]
+         [--kv-quant] [--gpus N] [--mtp [K]] [--tokens id id ...]
+         [--no-auto-trunc] [-m model.gguf]
 ```
 
 Interactive REPL; reads a question per line, streams the answer, prints
@@ -127,21 +128,42 @@ prefill/decode tok/s. Defaults to greedy (temp 0) so regressions are
 deterministic; `--temp 1.0 --top-k 20 --top-p 0.95` are the
 GGUF-recommended sampling settings. `--kv-quant` stores K as Q8 and V as
 MXFP4 (2.5× smaller KV; decode wins beyond ~30k context, costs ~5% below).
+`--tokens id id ...` bypasses the tokenizer and chat template and feeds
+raw token ids (useful for parity tests against other runtimes). Prompts
+that exceed the KV budget are auto-truncated by default;
+`--no-auto-trunc` skips them with a diagnostic instead.
+
+`--mtp [K]` enables self-speculative decode using the model's own MTP
+(multi-token-prediction) head: the nextn module drafts K tokens ahead,
+a batched verify pass accepts or rolls back — including full rollback
+of the hybrid SSM/conv state, which is what makes speculation legal on
+this recurrent architecture. Output is bit-identical to plain greedy
+decode (exact-match verify, shared argmax tie-break). Requires a GGUF
+that carries the nextn tensors (the `_MTP` variant); greedy and
+single-GPU only, K = 1–3 (default and recommended: 1 — deeper fixed
+drafts measure slower at depth). Typical gain ~+8% flat (313 vs 291
+t/s, ~77% accept on prose); a per-run accept-rate line is printed on
+exit.
 
 ### Benchmark
 
 ```sh
-./q36_bench -p 2048,16384,90112 -n 128 -d 0,32768 -r 3 [--kv-quant]
+./q36_bench -p 2048,8192,32768,90112 -n 128 -d 0,32768,90112 -r 3
+            [--ctx N] [--kv-quant] [--gpus N] [-m model.gguf]
 ```
 
 Raw synthetic token context (no tokenizer, content-independent), markdown
-table out, mean ± std over `-r` runs.
+table out, mean ± std over `-r` runs. `-p` sets prefill sizes, `-n` the
+generation length, `-d` the context depths for the `tg` rows; `--ctx`
+defaults to the largest requested test.
 
 ### OpenAI-compatible server
 
 ```sh
-./q36_server [--port 8080] [--ctx 32768] [--kv-quant] [--auto-purge]
-             [--cache-ram MB] [--cache-min tokens] [--cache-dir path] [--no-state-cache]
+./q36_server [--port 8080] [--ctx 32768] [--kv-quant] [--temp t]
+             [--mtp [K]] [--hide-think] [--no-auto-purge] [--cache-ram MB]
+             [--cache-min tokens] [--cache-dir path] [--cache-disk MB]
+             [--cache-log] [--no-state-cache] [-m model.gguf]
 ```
 
 - `POST /v1/chat/completions` — messages → Qwen chat template; SSE
@@ -157,6 +179,12 @@ table out, mean ± std over `-r` runs.
 - `--temp t` — default temperature when the request omits one (default
   1.0; `0` = greedy — recommended under agent harnesses, which rarely
   send a temperature).
+- `--mtp [K]` — self-speculative decode (see [Chat CLI](#chat-cli)) for
+  greedy requests; responses are byte-identical, just faster (measured
+  +7.4% generation on prose, 77% accept). Sampled requests automatically
+  use the plain decode path. The per-request log line gains an
+  `mtp accept` field. Pairs well with `--temp 0` under agent harnesses,
+  where every request becomes eligible.
 - `GET /v1/models`, `GET /health`; CORS enabled.
 - `scripts/server_smoke.sh` — end-to-end wire-format regression suite
   (both protocols, streaming grammar, tool calls, think handling).
@@ -178,9 +206,10 @@ table out, mean ± std over `-r` runs.
   including across graceful restarts. `--no-state-cache` disables;
   `--cache-log` enables per-operation `[ckpt]` log lines (default quiet —
   the per-request line already reports the cached token count).
-- `--auto-purge`: when a prompt would overflow `--ctx`, oldest non-system
-  messages are dropped (chat) or tokens left-truncated (completions);
-  without it, oversized prompts get a 400.
+- Auto-purge (default ON): when a prompt would overflow `--ctx`, oldest
+  non-system messages are dropped (chat) or tokens left-truncated
+  (completions). `--no-auto-purge` disables it, so oversized prompts get
+  a 400 instead (`--auto-purge` is accepted as a back-compat no-op).
 - Requests are served sequentially (the engine is single-stream by design).
 
 ```sh
@@ -208,7 +237,7 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
 ### Accuracy validation
 
 ```sh
-./q36_ppl -f wiki.test.raw [--window 512] [--kv-quant] [--max-windows N]
+./q36_ppl -f wiki.test.raw [--window 512] [--kv-quant] [--max-windows N] [-m model.gguf]
 ```
 
 Replicates llama-perplexity's methodology (independent windows, second
@@ -241,7 +270,17 @@ nothing measurable; kv-quant costs +0.54%.  Full run ~110s = release gate.
   are hardware-calibrated via the `test_mma_bs` harness.
 - Multi-GPU expert parallelism works but is a net loss on GeForce (no P2P);
   the `--gpus N` path is kept for P2P-capable hardware.
-- Env toggles: `Q36_DEBUG`, `Q36_NOGRAPH`, `Q36_NOPDL` (disable
-  programmatic dependent launch in the decode graph), `Q36_MEGA`, `Q36_NOFORK`,
-  `Q36_RSTAT`, `Q36_ENCTEST`, `Q36_PF2` (pre-tensor-core prefill attention
-  fallback for A/B).
+- Env toggles (user-facing): `Q36_MIX_HEAD=R` (mixed-precision output
+  head, first R rows FP8: ~+1.7% decode for +0.24% ppl at R=32768),
+  `Q36_NOPDL` (disable programmatic dependent launch in the decode
+  graph), `Q36_NOGRAPH` (disable CUDA-graph capture), `Q36_DEBUG`
+  (verbose per-layer device traces). Selftests: `Q36_STATE_TEST=1 ./q36`
+  (state save/load round-trip), `Q36_MTP_TEST=1 ./q36` (MTP hybrid-state
+  checkpoint/rollback). `Q36_MT_GEMV`/`Q36_MT_TILED` force a multi-slot
+  decode path and `Q36_CB*` drive the continuous-batching simulation —
+  see the README's multi-slot section. The remaining `Q36_*` knobs in
+  the source (`Q36_MEGA`, `Q36_NOFORK`, `Q36_NOMMA`, `Q36_PF2`,
+  `Q36_FP4_HEAD`, `Q36_FAKE_BATCH`, `Q36_RSTAT`, `Q36_ENCTEST`,
+  `Q36_TRACE`, `Q36_ATTN*`, `Q36_MTP_TRACE/PROF/SYNC/SWAP`) are
+  development A/B and profiling switches — grep the source before
+  relying on them.

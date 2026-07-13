@@ -6,8 +6,8 @@ A zero-dependency C/CUDA codebase specialized for a single model + GPU pairing �
 
 ### Key Features
 
-* 🚀 **Extreme Prefill Throughput**: Tensor-core FlashAttention prefill reaching **13.4k tokens/sec** (at context depth 2,048, measured on a GPU clocked at 400W) and **7.6k tokens/sec** (at context depth 90k).
-* ⚡ **Fast Decode**: Native token generation speeds of **270+ tokens/sec** using captured CUDA graphs with zero host syncs.
+* 🚀 **Extreme Prefill Throughput**: Tensor-core FlashAttention prefill reaching **13.7k tokens/sec** (at context depth 2,048, measured on a GPU clocked at 400W) and **7.8k tokens/sec** (at context depth 90k).
+* ⚡ **Fast Decode**: Native token generation speeds of **290+ tokens/sec** using captured CUDA graphs with zero host syncs — up to **~313 tokens/sec** with lossless self-speculative decode (`--mtp`, using the model's own multi-token-prediction head with full recurrent-state rollback).
 * 🧠 **Hybrid Architecture Support**: Native CUDA implementations for both 10 full-attention layers (using W4A8 block-scaled MMA MoE) and 30 recurrent SSM layers (gated-DeltaNet scans).
 * 💾 **Dual-Tier State Management**: Zero-overhead VRAM saving (**2.5× smaller KV cache** via `--kv-quant`) and DRAM/Disk state checkpoint caching (restoring context states in **3ms**).
 * 🌐 **OpenAI-Compatible Server**: A zero-dependency, prefix-cached HTTP server (`q36_server`) supporting SSE streaming and tool calling.
@@ -37,14 +37,24 @@ make q36 q36_bench q36_server
   ```bash
   ./q36 -m /path/to/model.gguf
   ```
+  All flags — sampling, `--kv-quant`, `--mtp` speculative decode, raw
+  token mode: [ENGINE.md § Chat CLI](docs/ENGINE.md#chat-cli).
 * **OpenAI Server**: Start the HTTP API server with state caching enabled:
   ```bash
   ./q36_server -m /path/to/model.gguf --port 8080 --ctx 32768
   ```
+  Add `--mtp` for lossless speculative decode on greedy requests (byte-identical
+  responses, ~+7% generation speed). All flags — protocols, default temperature,
+  think handling, auto-purge, cache tiers:
+  [ENGINE.md § server](docs/ENGINE.md#openai-compatible-server).
 * **Benchmark**: Run throughput tests:
   ```bash
   ./q36_bench -m /path/to/model.gguf
   ```
+  All flags and the exact scoreboard commands:
+  [ENGINE.md § Benchmark](docs/ENGINE.md#benchmark).
+* **Perplexity**: Validate accuracy against llama.cpp on WikiText-2:
+  [ENGINE.md § Accuracy validation](docs/ENGINE.md#accuracy-validation).
 
 ### 4. KV Cache & State Management (DRAM / VRAM)
 
@@ -67,6 +77,8 @@ Standard prefix caching fails in multi-turn agent/tool loops when prompts are re
   * `--cache-min tokens`: Minimum prefix token length to trigger checkpointing (default: `2048`).
   * `--cache-dir path`: Local directory path to write evicted checkpoints to disk (LRU tiering). Checkpoints persisted here survive server restarts.
   * `--no-state-cache`: Disables checkpoint caching completely.
+  * Full server flag reference (incl. `--cache-disk`, `--cache-log`):
+    [ENGINE.md § server](docs/ENGINE.md#openai-compatible-server).
 
 ### 5. Multi-Slot Capabilities & Continuous Batching
 
