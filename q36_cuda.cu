@@ -18,6 +18,17 @@
  * <https://www.gnu.org/licenses/>.
  */
 
+/* Programmatic Dependent Launch entry hook: when the launch carries the
+ * PDL attribute (Q36_PDL=1 decode graphs, see q36_engine_step), this grid
+ * may begin scheduling while its predecessor drains; the sync is the first
+ * statement of every kernel, so memory ordering is exactly serial.  No-op
+ * for launches without the attribute. */
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define Q36_GDS() cudaGridDependencySynchronize()
+#else
+#define Q36_GDS()
+#endif
+
 /* Qwen3.6-35B-A3B CUDA hot path.
  *
  * Design: batch=1 decode is memory-bandwidth bound (2.544 GiB active/token),
@@ -116,7 +127,7 @@ __device__ float dot_q6_K_row(const block_q6_K *row, const float *x, int K, int 
  * type.  bytes(W_row) is read once.  Grid: M warps.  x lives in global memory
  * (callers may stage it in shared for the hottest projections). */
 __global__ void q36_matvec(uint32_t type, const void *W, const float *x,
-                           float *y, int M, int K, uint64_t row_bytes) {
+                           float *y, int M, int K, uint64_t row_bytes) {Q36_GDS();
     int warp = (blockIdx.x * blockDim.x + threadIdx.x) / WARP;
     int lane = threadIdx.x & (WARP-1);
     if (warp >= M) return;
@@ -133,7 +144,7 @@ __global__ void q36_matvec(uint32_t type, const void *W, const float *x,
 }
 
 /* ---- RMSNorm: y = x / rms(x) * w  (w is F32) --------------------------- */
-__global__ void q36_rmsnorm(const float *x, const float *w, float *y, int n, float eps) {
+__global__ void q36_rmsnorm(const float *x, const float *w, float *y, int n, float eps) {Q36_GDS();
     /* single block, blockDim.x threads reduce over n */
     __shared__ float ssum;
     float local = 0.f;
@@ -155,7 +166,7 @@ __global__ void q36_rmsnorm(const float *x, const float *w, float *y, int n, flo
 
 /* Per-head RMSNorm over head_dim (256), used on q and k before RoPE. w is the
  * shared [256] gain vector applied to every head. */
-__global__ void q36_head_rmsnorm(float *x, const float *w, int n_head, int head_dim, float eps) {
+__global__ void q36_head_rmsnorm(float *x, const float *w, int n_head, int head_dim, float eps) {Q36_GDS();
     int h = blockIdx.x;                 /* one block per head */
     float *xh = x + h*head_dim;
     __shared__ float s;
@@ -173,7 +184,7 @@ __global__ void q36_head_rmsnorm(float *x, const float *w, int n_head, int head_
  * Rotate the first ROT_DIM (64) dims of each head with NeoX-style pairing.
  * Text-only decode uses the temporal position `pos` for all rope sections. */
 __global__ void q36_rope(float *x, int n_head, int head_dim, int rot_dim,
-                         int pos, float freq_base) {
+                         int pos, float freq_base) {Q36_GDS();
     int h = blockIdx.x;
     int i = threadIdx.x;                /* pair index within [0, rot_dim/2) */
     if (i >= rot_dim/2) return;
@@ -187,7 +198,7 @@ __global__ void q36_rope(float *x, int n_head, int head_dim, int rot_dim,
 }
 
 /* ---- sampling: argmax + temperature/top-k/top-p ------------------------- */
-__global__ void q36_argmax(const float *logits, int n, int *out) {
+__global__ void q36_argmax(const float *logits, int n, int *out) {Q36_GDS();
     /* Race-free block argmax: warp-reduce (value,index) pairs, stage one pair
      * per warp in shared memory, final scan by thread 0. */
     __shared__ float sv[32]; __shared__ int si[32];
@@ -226,7 +237,7 @@ extern "C" void q36_cuda_rope(float *x, int n_head, int head_dim, int rot_dim, i
 }
 /* two-stage argmax: 128 blocks of partials, then a single-warp finish.
  * The single-block version left 169 of 170 SMs idle (74us for a 1MB scan). */
-__global__ void q36_argmax_p1(const float *logits, int n, float *pv, int *pi) {
+__global__ void q36_argmax_p1(const float *logits, int n, float *pv, int *pi) {Q36_GDS();
     __shared__ float sv[32]; __shared__ int si[32];
     float lv = -1e30f; int li = 0;
     for (int i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += gridDim.x*blockDim.x)
@@ -245,7 +256,7 @@ __global__ void q36_argmax_p1(const float *logits, int n, float *pv, int *pi) {
         pv[blockIdx.x] = sv[0]; pi[blockIdx.x] = si[0];
     }
 }
-__global__ void q36_argmax_p2(const float *pv, const int *pi, int nparts, int *out) {
+__global__ void q36_argmax_p2(const float *pv, const int *pi, int nparts, int *out) {Q36_GDS();
     int lane = threadIdx.x;
     float lv = (lane < nparts) ? pv[lane] : -1e30f;
     int   li = (lane < nparts) ? pi[lane] : 0;

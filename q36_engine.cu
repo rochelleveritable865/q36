@@ -410,7 +410,7 @@ enum { NKH=Q36_SSM_GROUPS, NVH=Q36_SSM_DT_RANK, HKD=Q36_SSM_STATE, HVD=Q36_SSM_I
 /* ---- gated DeltaNet conv (decode step) --------------------------------
  * causal depthwise conv over CONVD channels, kernel 4, then silu.  history is
  * [CONVD][3] most-recent-last. */
-__global__ void k_dn_conv(const float*in,const float*w,float*hist,float*out,int convd,int K){
+__global__ void k_dn_conv(const float*in,const float*w,float*hist,float*out,int convd,int K){Q36_GDS();
     int c=blockIdx.x*blockDim.x+threadIdx.x; if(c>=convd)return;
     float acc=0;
     /* window = hist[0],hist[1],hist[2], in[c] */
@@ -422,13 +422,22 @@ __global__ void k_dn_conv(const float*in,const float*w,float*hist,float*out,int 
     hist[c*3+0]=win[1]; hist[c*3+1]=win[2]; hist[c*3+2]=win[3];
 }
 
-/* Engine matvec: dispatches split-Q8_0 (repacked, coalesced) or raw layouts. */
-__global__ void k_matvec_g(uint32_t type,int split,const void*W,const float*x,float*y,
-                           int M,int K,uint64_t row_bytes){
+/* Path-specialized engine matvec (split-Q8_0 repacked/coalesced, split
+ * FP8/NVFP4 heads, or raw row layouts).  The old runtime-dispatched
+ * k_matvec_g inlined ALL dot cores into one kernel; the register
+ * allocation for the union (255/thread, dominated by the k-quant row
+ * dots) capped occupancy at ONE block per SM (16.67%, ncu-verified).
+ * The path is known at launch, so each instantiation carries only its
+ * own core.  Bit-identical math per path. */
+enum { MV_MIXED=4, MV_NVFP4=3, MV_E4M3=2, MV_Q8SPLIT=1,
+       MV_Q8ROW=10, MV_MXFP4ROW=11, MV_Q5KROW=12, MV_Q6KROW=13 };
+template<int P>
+__global__ void k_matvec_t(const void*W,const float*x,float*y,
+                           int M,int K,uint64_t row_bytes){Q36_GDS();
     int warp=(blockIdx.x*blockDim.x+threadIdx.x)/WARP, lane=threadIdx.x&31;
     if(warp>=M)return;
     float r;
-    if(split==4){   /* mixed head: rows<R e4m3, tail nvfp4 (R in row_bytes) */
+    if constexpr(P==MV_MIXED){ /* rows<R e4m3, tail nvfp4 (R in row_bytes) */
         int R=(int)row_bytes;
         if(warp<R){
             const uint8_t*qs=(const uint8_t*)W+(uint64_t)warp*K;
@@ -441,34 +450,46 @@ __global__ void k_matvec_g(uint32_t type,int split,const void*W,const float*x,fl
             const uint8_t*es=base+(uint64_t)MT*(K/2)+(uint64_t)w2*(K/16);
             r=dot_nvfp4_split(qs,es,x,K,lane);
         }
-    } else if(split==3){   /* nvfp4-split (4.5-bit output head) */
+    } else if constexpr(P==MV_NVFP4){
         const uint8_t*qs=(const uint8_t*)W+(uint64_t)warp*(K/2);
         const uint8_t*es=(const uint8_t*)W+(uint64_t)M*(K/2)+(uint64_t)warp*(K/16);
         r=dot_nvfp4_split(qs,es,x,K,lane);
-    } else if(split==2){   /* e4m3-split (FP8 output head) */
+    } else if constexpr(P==MV_E4M3){
         const uint8_t*qs=(const uint8_t*)W+(uint64_t)warp*K;
         const uint8_t*es=(const uint8_t*)W+(uint64_t)M*K+(uint64_t)warp*(K/32);
         r=dot_e4m3_split(qs,es,x,K,lane);
-    } else if(split){
+    } else if constexpr(P==MV_Q8SPLIT){
         const int8_t*qs=(const int8_t*)W+(uint64_t)warp*K;
         const __half*ds=(const __half*)((const uint8_t*)W+(uint64_t)M*K)+(uint64_t)warp*(K/32);
         r=dot_q8_0_split(qs,ds,x,K,lane);
     } else {
         const uint8_t*row=(const uint8_t*)W+(uint64_t)warp*row_bytes;
-        switch(type){
-            case Q36_GGML_Q8_0:  r=dot_q8_0_row((const block_q8_0*)row,x,K,lane); break;
-            case Q36_GGML_MXFP4: r=dot_mxfp4_row((const block_mxfp4*)row,x,K,lane); break;
-            case Q36_GGML_Q5_K:  r=dot_q5_K_row((const block_q5_K*)row,x,K,lane); break;
-            case Q36_GGML_Q6_K:  r=dot_q6_K_row((const block_q6_K*)row,x,K,lane); break;
-            default: r=0.f;
-        }
+        if constexpr(P==MV_Q8ROW)    r=dot_q8_0_row((const block_q8_0*)row,x,K,lane);
+        if constexpr(P==MV_MXFP4ROW) r=dot_mxfp4_row((const block_mxfp4*)row,x,K,lane);
+        if constexpr(P==MV_Q5KROW)   r=dot_q5_K_row((const block_q5_K*)row,x,K,lane);
+        if constexpr(P==MV_Q6KROW)   r=dot_q6_K_row((const block_q6_K*)row,x,K,lane);
     }
     if(lane==0)y[warp]=r;
 }
-static void mv(const dw*W,const float*x,float*y){
+static void mv_on(cudaStream_t s,const dw*W,const float*x,float*y){
     int sp=(W->elayout==5)?4:(W->elayout==4)?3:(W->elayout==3)?2:(W->split?1:0);
-    k_matvec_g<<<gr(W->M,8),256>>>(W->type,sp,W->d,x,y,W->M,W->K,W->row_bytes);
+    int p = sp? sp :
+        (W->type==Q36_GGML_Q8_0)? MV_Q8ROW :
+        (W->type==Q36_GGML_MXFP4)? MV_MXFP4ROW :
+        (W->type==Q36_GGML_Q5_K)? MV_Q5KROW : MV_Q6KROW;
+    dim3 g(gr(W->M,8));
+    switch(p){
+        case MV_MIXED:   k_matvec_t<MV_MIXED>   <<<g,256,0,s>>>(W->d,x,y,W->M,W->K,W->row_bytes); break;
+        case MV_NVFP4:   k_matvec_t<MV_NVFP4>   <<<g,256,0,s>>>(W->d,x,y,W->M,W->K,W->row_bytes); break;
+        case MV_E4M3:    k_matvec_t<MV_E4M3>    <<<g,256,0,s>>>(W->d,x,y,W->M,W->K,W->row_bytes); break;
+        case MV_Q8SPLIT: k_matvec_t<MV_Q8SPLIT> <<<g,256,0,s>>>(W->d,x,y,W->M,W->K,W->row_bytes); break;
+        case MV_Q8ROW:   k_matvec_t<MV_Q8ROW>   <<<g,256,0,s>>>(W->d,x,y,W->M,W->K,W->row_bytes); break;
+        case MV_MXFP4ROW:k_matvec_t<MV_MXFP4ROW><<<g,256,0,s>>>(W->d,x,y,W->M,W->K,W->row_bytes); break;
+        case MV_Q5KROW:  k_matvec_t<MV_Q5KROW>  <<<g,256,0,s>>>(W->d,x,y,W->M,W->K,W->row_bytes); break;
+        default:         k_matvec_t<MV_Q6KROW>  <<<g,256,0,s>>>(W->d,x,y,W->M,W->K,W->row_bytes); break;
+    }
 }
+static void mv(const dw*W,const float*x,float*y){ mv_on(0,W,x,y); }
 
 /* Fused multi-tensor matvec: up to 3 split-Q8 weights sharing input x in one
  * launch.  Kills the per-kernel latency floor of small dependent matvecs
@@ -476,7 +497,7 @@ static void mv(const dw*W,const float*x,float*y){
 __global__ void k_matvec_multi3(const void*W1,int M1,float*y1,
                                 const void*W2,int M2,float*y2,
                                 const void*W3,int M3,float*y3,
-                                const float*x,int K){
+                                const float*x,int K){Q36_GDS();
     int warp=(blockIdx.x*blockDim.x+threadIdx.x)/WARP, lane=threadIdx.x&31;
     const void*W; float*y; int M,r=warp;
     if(r<M1){ W=W1;y=y1;M=M1; }
@@ -496,7 +517,7 @@ __global__ void k_matvec_multi3(const void*W1,int M1,float*y1,
  * k_head_argmax_p2 folds blocks.  Turns B serial 0.5GB head reads into ONE.
  * elayout: 3=e4m3, 4=nvfp4, 5=mixed(row<R e4m3 else nvfp4), else split-q8. */
 __global__ void k_head_argmax_p1(int elayout,const void*W,const float*x,int Rmix,
-                                 int M,int K,int B,uint64_t xs,float*pv,int*pi,int nblk){
+                                 int M,int K,int B,uint64_t xs,float*pv,int*pi,int nblk){Q36_GDS();
     int warp=(blockIdx.x*blockDim.x+threadIdx.x)/WARP, lane=threadIdx.x&31, wid=threadIdx.x>>5;
     int row=warp;
     float lmax[16]; int lidx[16];
@@ -546,7 +567,7 @@ __global__ void k_head_argmax_p1(int elayout,const void*W,const float*x,int Rmix
  * EXPLICIT lowest-index tie-break: the winner is a pure function of the
  * partial values, independent of B and thread mapping, so plain decode and
  * the MTP verify head agree on exact logit ties by construction. */
-__global__ void k_head_argmax_p2(const float*pv,const int*pi,int nblk,int B,int*out){
+__global__ void k_head_argmax_p2(const float*pv,const int*pi,int nblk,int B,int*out){Q36_GDS();
     int b=blockIdx.x;
     float mv=-1e30f; int mi=INT_MAX;
     for(int i=threadIdx.x;i<nblk;i+=blockDim.x){
@@ -577,7 +598,7 @@ __global__ void k_head_argmax_p2(const float*pv,const int*pi,int nblk,int B,int*
 __global__ void k_expert_gemv2_bt(int elg,const void*Wg,uint64_t sg,
                                int elu,const void*Wu,uint64_t su,int se0,int se1,
                                const int*topk,const float*x,float*yg,float*yu,
-                               int M,int K,int NUp,uint64_t xs){
+                               int M,int K,int NUp,uint64_t xs){Q36_GDS();
     int gy=blockIdx.y, which=blockIdx.z;
     int tenant=gy/NUp, slot=gy;             /* topk/y indexed by GLOBAL slot */
     int warp=(blockIdx.x*blockDim.x+threadIdx.x)/WARP, lane=threadIdx.x&31;
@@ -602,7 +623,7 @@ __global__ void k_expert_gemv2_bt(int elg,const void*Wg,uint64_t sg,
 /* batched down proj: x is per-(tenant,slot) swiglu output */
 __global__ void k_expert_gemv_bt(int elayout,const void*W,uint64_t estride,
                               int se0,int se1,const int*topk,const float*x,
-                              uint64_t x_stride,float*y,int M,int K){
+                              uint64_t x_stride,float*y,int M,int K){Q36_GDS();
     int slot=blockIdx.y;                     /* GLOBAL slot 0..B*NU-1 */
     int warp=(blockIdx.x*blockDim.x+threadIdx.x)/WARP, lane=threadIdx.x&31;
     if(warp>=M)return;
@@ -630,7 +651,7 @@ __global__ void k_expert_gemv_bt(int elayout,const void*W,uint64_t estride,
 __global__ void k_matvec_multi3_b(const void*W1,int M1,float*y1,uint64_t ys1,
                                   const void*W2,int M2,float*y2,uint64_t ys2,
                                   const void*W3,int M3,float*y3,uint64_t ys3,
-                                  const float*x,int K,int B,uint64_t xs){
+                                  const float*x,int K,int B,uint64_t xs){Q36_GDS();
     int warp=(blockIdx.x*blockDim.x+threadIdx.x)/WARP, lane=threadIdx.x&31;
     const void*W; float*y; int M,r=warp; uint64_t ys;
     if(r<M1){ W=W1;y=y1;M=M1;ys=ys1; }
@@ -645,7 +666,7 @@ __global__ void k_matvec_multi3_b(const void*W1,int M1,float*y1,uint64_t ys1,
     }
 }
 __global__ void k_matvec_gb(int split,const void*W,const float*x,float*y,
-                            int M,int K,int B,uint64_t xs,uint64_t ys){
+                            int M,int K,int B,uint64_t xs,uint64_t ys){Q36_GDS();
     int warp=(blockIdx.x*blockDim.x+threadIdx.x)/WARP, lane=threadIdx.x&31;
     if(warp>=M)return;
     /* split-q8 only: every batched dense tensor is elayout 1 */
@@ -658,7 +679,7 @@ __global__ void k_matvec_gb(int split,const void*W,const float*x,float*y,
     }
 }
 __global__ void k_matvec_f32_b(const float*W,const float*x,float*y,int M,int K,
-                               int B,uint64_t xs,uint64_t ys){
+                               int B,uint64_t xs,uint64_t ys){Q36_GDS();
     int warp=(blockIdx.x*blockDim.x+threadIdx.x)/WARP, lane=threadIdx.x&31;
     if(warp>=M)return;
     const float*row=W+(uint64_t)warp*K;
@@ -672,7 +693,7 @@ __global__ void k_matvec_f32_b(const float*W,const float*x,float*y,int M,int K,
 }
 
 /* h += a (residual), then y = rmsnorm(h)*w -- one launch instead of two. */
-__global__ void k_add_rmsnorm(float*h,const float*a,const float*w,float*y,int n,float eps){
+__global__ void k_add_rmsnorm(float*h,const float*a,const float*w,float*y,int n,float eps){Q36_GDS();
     __shared__ float part[32]; __shared__ float ss;
     float loc=0;
     for(int i=threadIdx.x;i<n;i+=blockDim.x){ float v=h[i]+a[i]; h[i]=v; loc+=v*v; }
@@ -690,61 +711,79 @@ __global__ void k_add_rmsnorm(float*h,const float*a,const float*w,float*y,int n,
 __global__ void k_expert_gemv(int elayout,const void*W,uint64_t expert_stride,
                               int se0,int se1,
                               const int*topk,const float*x,uint64_t x_stride,float*y,
-                              int M,int K){
+                              int M,int K){Q36_GDS();
+    /* dual-row warps, same rationale as k_expert_gemv2 (M even: D=2048) */
     int slot=blockIdx.y;
     int warp=(blockIdx.x*blockDim.x+threadIdx.x)/WARP, lane=threadIdx.x&31;
-    if(warp>=M)return;
+    int Mh=M>>1;
+    if(warp>=Mh)return;
+    int r0=warp, r1=warp+Mh;
     int ex=topk[slot];
-    if(ex<se0||ex>=se1){ if(lane==0)y[(size_t)slot*M+warp]=0.f; return; }
+    if(ex<se0||ex>=se1){
+        if(lane==0){ y[(size_t)slot*M+r0]=0.f; y[(size_t)slot*M+r1]=0.f; }
+        return;
+    }
     x+= (uint64_t)slot*x_stride;   /* 0 = same input for all slots (gate/up) */
     const uint8_t*base=(const uint8_t*)W+(uint64_t)(ex-se0)*expert_stride;
-    float r;
+    float v0,v1;
     if(elayout==2){        /* mxfp4-split: [qs M*K/2][es M*K/32] per expert */
-        const uint8_t*qs=base+(uint64_t)warp*(K/2);
-        const uint8_t*es=base+(uint64_t)M*(K/2)+(uint64_t)warp*(K/32);
-        r=dot_mxfp4_split(qs,es,x,K,lane);
+        const uint8_t*qs=base, *es=base+(uint64_t)M*(K/2);
+        dot_mxfp4_split_x2(qs+(uint64_t)r0*(K/2),es+(uint64_t)r0*(K/32),
+                           qs+(uint64_t)r1*(K/2),es+(uint64_t)r1*(K/32),
+                           x,K,lane,&v0,&v1);
     } else {               /* q8_0-split: [qs M*K][ds M*K/16] per expert */
-        const int8_t*qs=(const int8_t*)base+(uint64_t)warp*K;
-        const __half*ds=(const __half*)(base+(uint64_t)M*K)+(uint64_t)warp*(K/32);
-        r=dot_q8_0_split(qs,ds,x,K,lane);
+        const int8_t*qs=(const int8_t*)base;
+        const __half*ds=(const __half*)(base+(uint64_t)M*K);
+        dot_q8_0_split_x2(qs+(uint64_t)r0*K,ds+(uint64_t)r0*(K/32),
+                          qs+(uint64_t)r1*K,ds+(uint64_t)r1*(K/32),
+                          x,K,lane,&v0,&v1);
     }
-    if(lane==0) y[(size_t)slot*M+warp]=r;
+    if(lane==0){ y[(size_t)slot*M+r0]=v0; y[(size_t)slot*M+r1]=v1; }
 }
 /* silu(g)*u over all slots at once. */
-__global__ void k_silu_mul_slots(float*g,const float*u,int n){
+__global__ void k_silu_mul_slots(float*g,const float*u,int n){Q36_GDS();
     int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<n) g[i]=silu(g[i])*u[i];
 }
-/* gate+up expert GEMVs fused into one launch via grid.z (independent). */
+/* gate+up expert GEMVs fused into one launch via grid.z (independent).
+ * One warp owns rows (w, w+M/2): the dual-row dots keep 4 weight loads in
+ * flight per lane, which the ~one-wave GEMV grid needs to reach DRAM
+ * bandwidth (occupancy can't provide the parallelism here).  M is even
+ * (FF=512).  Results are bit-identical to the single-row form. */
 __global__ void k_expert_gemv2(int elg,const void*Wg,uint64_t sg,
                                int elu,const void*Wu,uint64_t su,int se0,int se1,
                                const int*topk,const float*x,float*yg,float*yu,
-                               int M,int K){
+                               int M,int K){Q36_GDS();
     int slot=blockIdx.y, which=blockIdx.z;
     int warp=(blockIdx.x*blockDim.x+threadIdx.x)/WARP, lane=threadIdx.x&31;
-    if(warp>=M)return;
+    int Mh=M>>1;
+    if(warp>=Mh)return;
+    int r0=warp, r1=warp+Mh;
     int ex=topk[slot];
+    float*y = which? yu:yg;
     if(ex<se0||ex>=se1){                      /* non-resident: zero contribution */
-        if(lane==0)(which?yu:yg)[(size_t)slot*M+warp]=0.f;
+        if(lane==0){ y[(size_t)slot*M+r0]=0.f; y[(size_t)slot*M+r1]=0.f; }
         return;
     }
     int el = which? elu:elg;
     const uint8_t*base=(const uint8_t*)(which?Wu:Wg)+(uint64_t)(ex-se0)*(which?su:sg);
-    float*y = which? yu:yg;
-    float r;
+    float v0,v1;
     if(el==2){
-        const uint8_t*qs=base+(uint64_t)warp*(K/2);
-        const uint8_t*es=base+(uint64_t)M*(K/2)+(uint64_t)warp*(K/32);
-        r=dot_mxfp4_split(qs,es,x,K,lane);
+        const uint8_t*qs=base, *es=base+(uint64_t)M*(K/2);
+        dot_mxfp4_split_x2(qs+(uint64_t)r0*(K/2),es+(uint64_t)r0*(K/32),
+                           qs+(uint64_t)r1*(K/2),es+(uint64_t)r1*(K/32),
+                           x,K,lane,&v0,&v1);
     } else {
-        const int8_t*qs=(const int8_t*)base+(uint64_t)warp*K;
-        const __half*ds=(const __half*)(base+(uint64_t)M*K)+(uint64_t)warp*(K/32);
-        r=dot_q8_0_split(qs,ds,x,K,lane);
+        const int8_t*qs=(const int8_t*)base;
+        const __half*ds=(const __half*)(base+(uint64_t)M*K);
+        dot_q8_0_split_x2(qs+(uint64_t)r0*K,ds+(uint64_t)r0*(K/32),
+                          qs+(uint64_t)r1*K,ds+(uint64_t)r1*(K/32),
+                          x,K,lane,&v0,&v1);
     }
-    if(lane==0) y[(size_t)slot*M+warp]=r;
+    if(lane==0){ y[(size_t)slot*M+r0]=v0; y[(size_t)slot*M+r1]=v1; }
 }
 /* moe[i] = sum_slot w[slot]*down[slot][i] + sigmoid(*shgate)*shared[i] */
 __global__ void k_moe_combine(float*moe,const float*down,const float*w,
-                              const float*shared,const float*shgate,int M,int nslots){
+                              const float*shared,const float*shgate,int M,int nslots){Q36_GDS();
     int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=M)return;
     float acc=0;
     for(int s=0;s<nslots;s++) acc+=w[s]*down[(size_t)s*M+i];
@@ -788,7 +827,7 @@ __device__ __forceinline__ uint8_t e2m1_encode(float x){
 /* quantize one position's K (int8/f16-scale) and V (e2m1/ue8m0) per 32-block.
  * one warp per 32-dim block: warps 0..15 = K, 16..31 = V. */
 __global__ void k_kv_append(const float*k,const float*v,int8_t*Kc,__half*Ks,
-                            uint8_t*Vc,uint8_t*Vs,const int*posp,int kv_dim,int kvq){
+                            uint8_t*Vc,uint8_t*Vs,const int*posp,int kv_dim,int kvq){Q36_GDS();
     int warp=(blockIdx.x*blockDim.x+threadIdx.x)>>5, lane=threadIdx.x&31;
     int nb=kv_dim/32;
     if(warp>=2*nb)return;
@@ -821,12 +860,12 @@ __global__ void k_kv_append(const float*k,const float*v,int8_t*Kc,__half*Ks,
         if(lane==0) Vs[(size_t)pos*nb+b]=(uint8_t)(127+e2);
     }
 }
-__global__ void k_embed_dt(const block_q8_0*emb,const int*tokp,float*h,int D){
+__global__ void k_embed_dt(const block_q8_0*emb,const int*tokp,float*h,int D){Q36_GDS();
     const block_q8_0*row=emb+(size_t)(*tokp)*(D/32);
     int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=D)return;
     const block_q8_0*b=row+i/32; h[i]=q36_fp16(b->d)*b->qs[i%32];
 }
-__global__ void k_rope_p(float*x,int head_dim,int rot_dim,const int*posp,float base){
+__global__ void k_rope_p(float*x,int head_dim,int rot_dim,const int*posp,float base){Q36_GDS();
     int h=blockIdx.x, i=threadIdx.x; if(i>=rot_dim/2)return;
     float*xh=x+(size_t)h*head_dim;
     float inv=__powf(base,-2.0f*i/rot_dim), ang=(float)(*posp)*inv;
@@ -839,7 +878,7 @@ __global__ void k_attn_partial(const float*Q,const int8_t*Kc,const __half*Ks,
                                const uint8_t*Vc,const uint8_t*Vs,
                                float*pacc,float2*pms,float*final_out,
                                int n_head,int n_head_kv,int head_dim,const int*posp,
-                               float scale,int kvq){
+                               float scale,int kvq){Q36_GDS();
     int h=blockIdx.y, chunk=blockIdx.x, nchunks=gridDim.x;
     int seqlen=*posp+1;
     if(chunk*Q36_ATTN_CHUNK>=seqlen) return;   /* beyond live prefix */
@@ -928,7 +967,7 @@ __global__ void k_attn_partial2(const float*Q,const int8_t*Kc,const __half*Ks,
                                 const uint8_t*Vc,const uint8_t*Vs,
                                 float*pacc,float2*pms,float*final_out,
                                 int n_head,int n_head_kv,int head_dim,const int*posp,
-                                float scale,int kvq){
+                                float scale,int kvq){Q36_GDS();
     int kvh=blockIdx.y, chunk=blockIdx.x, nchunks=gridDim.x;
     int seqlen=*posp+1;
     /* dynamic re-chunk: split the LIVE prefix evenly over the captured grid
@@ -1050,7 +1089,7 @@ template<int MINB>
 __global__ void __launch_bounds__(128,MINB) k_attn_dec_mma(
         const float*Q,const __half*Kh,const __half*Vh,
         float*pacc,float2*pms,int n_head,int n_head_kv,int head_dim,
-        const int*posp,float scale){
+        const int*posp,float scale){Q36_GDS();
     enum{HD=Q36_HEAD_DIM};
     /* KP=HD (no padding) + XOR swizzle: 16B chunk j of row r lives at
      * j^(r&7).  Padding to 264 halves cost 1.8KB/buffer and capped the
@@ -1195,7 +1234,7 @@ __global__ void __launch_bounds__(128,MINB) k_attn_dec_mma(
  * The single-level merge looped every slot serially per thread: 152us at
  * 32k depth vs 58us for the attention kernel itself. */
 __global__ void k_attn_merge2(const float*pacc,const float2*pms,float*out,
-                              int nslots,const int*posp){
+                              int nslots,const int*posp){Q36_GDS();
     enum{HD=Q36_HEAD_DIM};
     int h=blockIdx.x;
     int dl=threadIdx.x&31, d=blockIdx.y*32+dl, sl0=threadIdx.x>>5;
@@ -1228,7 +1267,7 @@ __global__ void k_attn_merge2(const float*pacc,const float2*pms,float*out,
 }
 
 __global__ void k_attn_merge(const float*pacc,const float2*pms,float*out,
-                             int head_dim,int nchunks,const int*posp,int chunk_sz){
+                             int head_dim,int nchunks,const int*posp,int chunk_sz){Q36_GDS();
     int h=blockIdx.x, d=threadIdx.x; if(d>=head_dim)return;
     /* chunk_sz>0: fixed chunks (per-q-head kernel); 0: dynamic re-chunk
      * (GQA kernel); -1: dynamic re-chunk with 4 warp sub-slots per chunk
@@ -1276,7 +1315,7 @@ __global__ void k_attn_merge(const float*pacc,const float2*pms,float*out,
  * q/k staged in shared memory. */
 __global__ void k_dn_scan(const float*qc,const float*kc,const float*vc,
                           const float*g,const float*beta,float*S,float*out,
-                          int nvh,int nkh,int hkd,int hvd){
+                          int nvh,int nkh,int hkd,int hvd){Q36_GDS();
     int h=blockIdx.y;
     int warp=threadIdx.x>>5, lane=threadIdx.x&31;
     int j=blockIdx.x*(blockDim.x>>5)+warp;
@@ -1305,7 +1344,7 @@ __global__ void k_dn_scan(const float*qc,const float*kc,const float*vc,
 __global__ void k_dn_scan_b(const float*qc0,const float*kc0,const float*vc0,
                           const float*g0,const float*beta0,float*S0,float*out0,
                           int nvh,int nkh,int hkd,int hvd,
-                          uint64_t in_s,uint64_t gv_s,uint64_t S_s,uint64_t out_s){
+                          uint64_t in_s,uint64_t gv_s,uint64_t S_s,uint64_t out_s){Q36_GDS();
     int t=blockIdx.z;
     const float*qc=qc0+(size_t)t*in_s, *kc=kc0+(size_t)t*in_s, *vc=vc0+(size_t)t*in_s;
     const float*g=g0+(size_t)t*gv_s, *beta=beta0+(size_t)t*gv_s;
@@ -1338,7 +1377,7 @@ __global__ void k_dn_scan_b(const float*qc0,const float*kc0,const float*vc0,
  * contexts (graph vs eager), which broke MTP-verify bit-parity with solo
  * decode -- every other decode norm is <=2 warps (commutative-safe) or
  * already fixed-order. */
-__global__ void k_dn_gnorm(float*out,const float*gain,const float*z,int nvh,int hvd,float eps){
+__global__ void k_dn_gnorm(float*out,const float*gain,const float*z,int nvh,int hvd,float eps){Q36_GDS();
     int h=blockIdx.x; float*oh=out+h*hvd; const float*zh=z+h*hvd;
     __shared__ float part[32]; __shared__ float ss;
     float loc=0;
@@ -1352,7 +1391,7 @@ __global__ void k_dn_gnorm(float*out,const float*gain,const float*z,int nvh,int 
 }
 /* softplus(alpha+dt)*a -> g[nvh]; beta sigmoid.  grid.y = batch row. */
 __global__ void k_dn_gates(const float*alpha,const float*dt,const float*a,const float*betain,
-                           float*g,float*beta,int nvh){
+                           float*g,float*beta,int nvh){Q36_GDS();
     int t=blockIdx.y;
     alpha+=(size_t)t*nvh; betain+=(size_t)t*nvh; g+=(size_t)t*nvh; beta+=(size_t)t*nvh;
     int h=blockIdx.x*blockDim.x+threadIdx.x; if(h>=nvh)return;
@@ -1559,7 +1598,7 @@ static void moe_ffn(q36_engine*e,dblock*db,const float*in,int L){
         if(se_)exit(1);} }while(0)
     /* router rows 0..255 + shared-gate row 256 in ONE f32 matvec (weights
      * were concatenated at load); shg scalar lands at rlogits[256] */
-    k_matvec_f32<<<gr(Q36_N_EXPERT+1,8),256>>>(db->router,in,e->rlogits,Q36_N_EXPERT+1,D);
+    k_matvec_f32_row<<<Q36_N_EXPERT+1,256>>>(db->router,in,e->rlogits,Q36_N_EXPERT+1,D);
     MOSY("router");
     k_router_topk<<<1,32>>>(e->rlogits,Q36_N_EXPERT,NU,e->d_topk,e->d_topw,e->expert_scale,1);
     MOSY("topk");
@@ -1568,13 +1607,13 @@ static void moe_ffn(q36_engine*e,dblock*db,const float*in,int L){
      * per-tile staging syncs don't amortize at one token) and cp.async
      * double-buffering in the prefill GEMM (5720->4596 t/s, block-level
      * parallelism already hides staging; 2x smem just cut occupancy). */
-    dim3 gg(gr(FF,8),NU,2);
+    dim3 gg(gr(FF/2,8),NU,2);   /* dual-row warps: half the row-blocks */
     k_expert_gemv2<<<gg,256>>>(db->gate_exps.elayout,db->gate_exps.d,db->gate_exps.expert_stride,
                                db->up_exps.elayout,db->up_exps.d,db->up_exps.expert_stride,
                                e->se0,e->se1,e->d_topk,in,e->g512,e->u512,FF,D);
     MOSY("gateup");
     k_silu_mul_slots<<<gr(NU*FF,256),256>>>(e->g512,e->u512,NU*FF);
-    dim3 gd(gr(D,8),NU);
+    dim3 gd(gr(D/2,8),NU);      /* dual-row warps */
     k_expert_gemv<<<gd,256>>>(db->down_exps.elayout,db->down_exps.d,db->down_exps.expert_stride,
                               e->se0,e->se1,e->d_topk,e->g512,FF,e->d2048,D,FF);
     MOSY("down");
@@ -1589,9 +1628,7 @@ static void moe_ffn(q36_engine*e,dblock*db,const float*in,int L){
     k_matvec_multi3<<<gr(2*FF,8),256,0,sh_s>>>(db->sh_gate.d,FF,e->sh_a,
                                         db->sh_up.d,FF,e->sh_b,NULL,0,NULL,in,D);
     k_silu_mul<<<gr(FF,256),256,0,sh_s>>>(e->sh_a,e->sh_b,FF);
-    {   int sp=(db->sh_down.elayout==3)?2:(db->sh_down.split?1:0);
-        k_matvec_g<<<gr(db->sh_down.M,8),256,0,sh_s>>>(db->sh_down.type,sp,db->sh_down.d,
-            e->sh_a,e->shexp,db->sh_down.M,db->sh_down.K,db->sh_down.row_bytes); }
+    mv_on(sh_s,&db->sh_down,e->sh_a,e->shexp);
     if(fork){ CK(cudaEventRecord(e->ev_sh,e->s2));
               CK(cudaStreamWaitEvent(cudaStreamPerThread,e->ev_sh,0)); }
     MOSY("shared");
@@ -1674,7 +1711,7 @@ static void attn_layer(q36_engine*e,dblock*db,int L,const float*x,int maxch){
 __global__ void k_ssm_mega(const float*qkv,const float*z,const float*x,
                            const float*convw,float*hist,
                            const float*alphabeta,const float*dtb,const float*a_log,
-                           const float*gain,float*S,float*out,int nvh,int nkh,int hkd,int hvd){
+                           const float*gain,float*S,float*out,int nvh,int nkh,int hkd,int hvd){Q36_GDS();
     int kh=blockIdx.x, tid=threadIdx.x, lane=tid&31;
     __shared__ float qc[128],kc[128],vA[128],vB[128];
     __shared__ float red[32];
@@ -1795,7 +1832,7 @@ static void ssm_layer(q36_engine*e,dblock*db,int L,const float*x,int pos){
     k_head_l2norm<<<NKH,64>>>(kc,HKD,Q36_RMS_EPS);
     /* alpha+beta projections: one M=64 matvec over load-time-concatenated
      * weights (alpha rows 0..31, beta rows 32..63) */
-    k_matvec_f32<<<gr(2*NVH,8),256>>>(db->alpha,x,e->g512,2*NVH,Q36_D_MODEL);
+    k_matvec_f32_row<<<2*NVH,256>>>(db->alpha,x,e->g512,2*NVH,Q36_D_MODEL);
     float *g=e->q, *beta=e->q+NVH;       /* reuse scratch */
     k_dn_gates<<<gr(NVH,64),64>>>(e->g512,db->dt_bias,db->ssm_a,e->g512+NVH,g,beta,NVH);
     if(L==0 && getenv("Q36_DEBUG")){ cudaDeviceSynchronize();
@@ -1830,7 +1867,7 @@ static void dbg_norm(q36_engine*e,const char*tag,int L){
  * temp/top-k/top-p with persistent xorshift RNG state in device memory, so a
  * captured graph replays with fresh randomness.  Two stages: per-block top-K
  * candidates, then one block merges + softmax(T) + nucleus cut + sample. */
-__global__ void k_sample_p1(const float*logits,int n,float*pv,int*pi,int k){
+__global__ void k_sample_p1(const float*logits,int n,float*pv,int*pi,int k){Q36_GDS();
     __shared__ float sv[2048]; __shared__ int si[2048];
     int nb=gridDim.x, slice=(n+nb-1)/nb;
     int s0=blockIdx.x*slice, s1=min(s0+slice,n);
@@ -1869,7 +1906,7 @@ __global__ void k_sample_p1(const float*logits,int n,float*pv,int*pi,int k){
     }
 }
 __global__ void k_sample_p2(const float*pv,const int*pi,int nparts,int k,
-                            float temp,float topp,unsigned long long*rng,int*out){
+                            float temp,float topp,unsigned long long*rng,int*out){Q36_GDS();
     __shared__ float sv[4096]; __shared__ int si[4096];
     int n=nparts*k;
     for(int i=threadIdx.x;i<4096;i+=blockDim.x){
@@ -2013,7 +2050,7 @@ static void q36_decode_body_mt(q36_engine*e,int maxch){
                 k_head_l2norm<<<NKH,64>>>(kb,HKD,Q36_RMS_EPS);
                 k_head_l2norm<<<NKH,64>>>(kb+KEYD,HKD,Q36_RMS_EPS);
                 float*ab=e->g512b+(size_t)i*4096;
-                k_matvec_f32<<<gr(2*NVH,8),256>>>(db->alpha,e->xb+(size_t)i*D,ab,2*NVH,D);
+                k_matvec_f32_row<<<2*NVH,256>>>(db->alpha,e->xb+(size_t)i*D,ab,2*NVH,D);
                 k_dn_gates<<<gr(NVH,64),64>>>(ab,db->dt_bias,db->ssm_a,ab+NVH,
                     e->qb+(size_t)i*4096,e->qb+(size_t)i*4096+NVH,NVH);
             }
@@ -2211,6 +2248,43 @@ extern "C" void q36_engine_set_sampler(q36_engine*e,float temp,int topk,float to
     if(e->gexec){ cudaGraphExecDestroy(e->gexec); e->gexec=NULL; }  /* recapture */
 }
 
+/* Programmatic Dependent Launch (default ON; Q36_NOPDL=1 disables):
+ * rewrite the captured decode graph's kernel->kernel edges as programmatic,
+ * so each grid's setup/scheduling overlaps its predecessor's drain instead
+ * of waiting for a hard boundary.  Every kernel begins with Q36_GDS()
+ * (grid dependency sync), so memory ordering stays exactly serial -- only
+ * launch latency is hidden.  Attacks the exposed-latency share of the
+ * decode roofline gap; measured +3.7%/+3.3%/+2.4% tg128 at d0/32k/90k. */
+static void pdl_edges(cudaGraph_t g){
+    size_t ne=0;
+    if(cudaGraphGetEdges(g,NULL,NULL,NULL,&ne)!=cudaSuccess||!ne) return;
+    cudaGraphNode_t*from=(cudaGraphNode_t*)malloc(ne*sizeof*from);
+    cudaGraphNode_t*to  =(cudaGraphNode_t*)malloc(ne*sizeof*to);
+    cudaGraphEdgeData*ed=(cudaGraphEdgeData*)calloc(ne,sizeof*ed);
+    CK(cudaGraphGetEdges(g,from,to,ed,&ne));
+    size_t swapped=0;
+    for(size_t i=0;i<ne;i++){
+        cudaGraphNodeType tf,tt;
+        cudaGraphNodeGetType(from[i],&tf); cudaGraphNodeGetType(to[i],&tt);
+        if(tf!=cudaGraphNodeTypeKernel||tt!=cudaGraphNodeTypeKernel) continue;
+        if(ed[i].type!=cudaGraphDependencyTypeDefault) continue;  /* only plain edges */
+        cudaGraphEdgeData pe; memset(&pe,0,sizeof pe);
+        pe.from_port=cudaGraphKernelNodePortProgrammatic;
+        pe.type=cudaGraphDependencyTypeProgrammatic;
+        if(cudaGraphRemoveDependencies(g,&from[i],&to[i],&ed[i],1)==cudaSuccess &&
+           cudaGraphAddDependencies(g,&from[i],&to[i],&pe,1)==cudaSuccess)
+            swapped++;
+        else {  /* restore the plain edge if the programmatic form was rejected */
+            cudaGetLastError();
+            cudaGraphAddDependencies(g,&from[i],&to[i],&ed[i],1);
+        }
+    }
+    static int once=0;
+    if(!once){ once=1;
+        fprintf(stderr,"[pdl] %zu/%zu kernel edges -> programmatic\n",swapped,ne); }
+    free(from); free(to); free(ed);
+}
+
 /* Decode step: uploads token+pos to device, then replays a captured graph of
  * the whole 40-layer step (recaptured when the sequence outgrows the current
  * chunk bucket).  Q36_NOGRAPH=1 or Q36_DEBUG=1 fall back to direct launch. */
@@ -2239,6 +2313,7 @@ extern "C" int q36_engine_step(q36_engine*e,int token,int pos){
             CK(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeGlobal));
             q36_decode_body(e,cap);
             CK(cudaStreamEndCapture(cudaStreamPerThread,&g));
+            if(!getenv("Q36_NOPDL")) pdl_edges(g);
             CK(cudaGraphInstantiate(&e->gexec,g,0));
             cudaGraphDestroy(g);
         }
@@ -2287,7 +2362,7 @@ __device__ __forceinline__ float q36_w_at(int wtype,const void*W,int M,int K,int
  * in smem (weights dequantized once per k-tile), f32 accumulate.  Block =
  * 8 warps covering 16 rows x 128 tokens; each warp owns one 16x16 wmma tile
  * per k-subtile.  X viewed col-major in smem gives B(k,t) for free. */
-__global__ void k_gemm_tc(int wtype,const void*W,const float*X,float*Y,int T,int M,int K){
+__global__ void k_gemm_tc(int wtype,const void*W,const float*X,float*Y,int T,int M,int K){Q36_GDS();
     __shared__ __align__(32) __half sw[16][72];
     __shared__ __align__(32) __half sx[128][72];
     int rb=blockIdx.x*16, tb=blockIdx.y*128, tid=threadIdx.x, warp=tid>>5;
@@ -2334,7 +2409,7 @@ __global__ void k_gemm_tc(int wtype,const void*W,const float*X,float*Y,int T,int
 #include <cuda_fp8.h>
 
 /* X[T][K] f32 -> Xq e4m3 bytes + Xs[T][K/32] ue8m0 scales (warp per block) */
-__global__ void k_quant_e4m3(const float*X,uint8_t*Xq,uint8_t*Xs,int T,int K){
+__global__ void k_quant_e4m3(const float*X,uint8_t*Xq,uint8_t*Xs,int T,int K){Q36_GDS();
     int nb=K/32;
     int gwarp=(blockIdx.x*blockDim.x+threadIdx.x)>>5, lane=threadIdx.x&31;
     if(gwarp>=T*nb)return;
@@ -2360,7 +2435,7 @@ __global__ void k_quant_e4m3(const float*X,uint8_t*Xq,uint8_t*Xs,int T,int K){
 __global__ void k_gemm_expert_mma(const void*W,uint64_t estride,int se0,int se1,
                                   const int*elist,const int*ecount,int cap,
                                   const uint8_t*Xq,const uint8_t*Xs,uint64_t x_stride,
-                                  float*Y,uint64_t y_stride,int M,int K){
+                                  float*Y,uint64_t y_stride,int M,int K){Q36_GDS();
     int ex=blockIdx.z;
     if(ex<se0||ex>=se1) return;              /* non-resident expert (shard) */
     int nt=ecount[ex];
@@ -2454,7 +2529,7 @@ __global__ void k_gemm_expert_mma(const void*W,uint64_t estride,int se0,int se1,
 __global__ void k_gemm_expert_i8(const void*W,uint64_t estride,int se0,int se1,
                                  const int*elist,const int*ecount,int cap,
                                  const int8_t*Xq,const float*Xsf,uint64_t x_stride,
-                                 float*Y,uint64_t y_stride,int M,int K){
+                                 float*Y,uint64_t y_stride,int M,int K){Q36_GDS();
     /* 64-entry tiles: the 16-entry shape re-read each expert's weights
      * ceil(nt/16) ~ 4x per launch and its 597us average matched the pure
      * W-traffic time (fully memory-bound). */
@@ -2549,7 +2624,7 @@ __global__ void k_gemm_expert_i8(const void*W,uint64_t estride,int se0,int se1,
  * change vs the CUDA-core path. */
 
 /* X[T][K] f32 -> int8 + per-32 float scales */
-__global__ void k_quant_q8b(const float*X,int8_t*Xq,float*Xsf,int T,int K){
+__global__ void k_quant_q8b(const float*X,int8_t*Xq,float*Xsf,int T,int K){Q36_GDS();
     int nb=K/32;
     int gwarp=(blockIdx.x*blockDim.x+threadIdx.x)>>5, lane=threadIdx.x&31;
     if(gwarp>=T*nb)return;
@@ -2565,7 +2640,7 @@ __global__ void k_quant_q8b(const float*X,int8_t*Xq,float*Xsf,int T,int K){
 }
 
 __global__ void k_gemm_i8(const void*W,const int8_t*Xq,const float*Xsf,
-                          float*Y,int T,int M,int K){
+                          float*Y,int T,int M,int K){Q36_GDS();
     /* 64-token tiles: each block amortizes its A-tile over more tokens
      * (L2 weight re-reads scale with T/BN; the big prefill shapes measured
      * 73% memory-throughput at BN=32 -- W traffic, not X, is the cost) */
@@ -2648,7 +2723,7 @@ __global__ void k_gemm_i8(const void*W,const int8_t*Xq,const float*Xsf,
 __global__ void k_gemm_expert_tc(int wtype,const void*W,uint64_t estride,int se0,int se1,
                                  const int*elist,const int*ecount,int cap,
                                  const float*X,uint64_t x_stride,int x_by_entry,
-                                 float*Y,uint64_t y_stride,int M,int K){
+                                 float*Y,uint64_t y_stride,int M,int K){Q36_GDS();
     int ex=blockIdx.z;
     if(ex<se0||ex>=se1) return;
     int nt=ecount[ex];
@@ -2701,7 +2776,7 @@ __global__ void k_gemm_expert_tc(int wtype,const void*W,uint64_t estride,int se0
 __global__ void k_attn_pf2(const float*Qb,const int8_t*Kc,const __half*Ks,
                            const uint8_t*Vc,const uint8_t*Vs,float*Ob,
                            int c0,int T,int n_head,int n_head_kv,int head_dim,
-                           float scale,int kvq){
+                           float scale,int kvq){Q36_GDS();
     int h=blockIdx.y, qt=blockIdx.x;
     int warp=threadIdx.x>>5, lane=threadIdx.x&31;
     int kvh=h/(n_head/n_head_kv), kv_dim=n_head_kv*head_dim;
@@ -2790,7 +2865,7 @@ __global__ void k_attn_pf2(const float*Qb,const int8_t*Kc,const __half*Ks,
 __global__ void __launch_bounds__(128,2) k_attn_pf3(
         const float*Qb,const int8_t*Kc,const __half*Ks,
         const uint8_t*Vc,const uint8_t*Vs,float*Ob,
-        int ctx0,int T,float scale,int kvq){
+        int ctx0,int T,float scale,int kvq){Q36_GDS();
     enum{HD=Q36_HEAD_DIM,NH=Q36_N_HEAD,NKV=Q36_N_HEAD_KV,KVD=Q36_KV_DIM,
          TQ=Q36_FA3_TQ,TK=Q36_FA3_TK,KP=HD+8,NB=KVD/32};
     __shared__ __align__(16) __half sK[TK][KP];
@@ -3029,7 +3104,7 @@ __global__ void __launch_bounds__(128,2) k_attn_pf3(
  * per-token flash-decode loop (T x 2 launches -> 1 launch per layer). */
 __global__ void k_attn_pf(const float*Qb,const int8_t*Kc,const __half*Ks,
                           const uint8_t*Vc,const uint8_t*Vs,float*Ob,
-                          int c0,int n_head,int n_head_kv,int head_dim,float scale,int kvq){
+                          int c0,int n_head,int n_head_kv,int head_dim,float scale,int kvq){Q36_GDS();
     int t=blockIdx.x, h=blockIdx.y;
     int seqlen=c0+t+1;
     int warp=threadIdx.x>>5, lane=threadIdx.x&31, nw=blockDim.x>>5;
@@ -3094,7 +3169,7 @@ __global__ void k_attn_pf(const float*Qb,const int8_t*Kc,const __half*Ks,
 }
 
 /* Y[t][r] = X[t][:] . W[r][:]  -- tiled 16x16, K tiles of 64 staged in smem */
-__global__ void k_gemm(int wtype,const void*W,const float*X,float*Y,int T,int M,int K){
+__global__ void k_gemm(int wtype,const void*W,const float*X,float*Y,int T,int M,int K){Q36_GDS();
     __shared__ float sw[16][64], sx[16][65];
     int rb=blockIdx.x*16, tb=blockIdx.y*16, tid=threadIdx.x;
     float acc=0;
@@ -3118,7 +3193,7 @@ __global__ void k_gemm(int wtype,const void*W,const float*X,float*Y,int T,int M,
 __global__ void k_gemm_expert(int wtype,const void*W,uint64_t estride,
                               const int*elist,const int*ecount,int cap,
                               const float*X,uint64_t x_stride,int x_by_entry,
-                              float*Y,uint64_t y_stride,int M,int K){
+                              float*Y,uint64_t y_stride,int M,int K){Q36_GDS();
     int ex=blockIdx.z, nt=ecount[ex];
     int tb=blockIdx.y*16;
     if(tb>=nt) return;
@@ -3146,13 +3221,13 @@ __global__ void k_gemm_expert(int wtype,const void*W,uint64_t estride,
 }
 
 /* ---- batched elementwise / small kernels for the chunk ------------------ */
-__global__ void k_embed_b(const block_q8_0*emb,const int*toks,float*H,int T,int D){
+__global__ void k_embed_b(const block_q8_0*emb,const int*toks,float*H,int T,int D){Q36_GDS();
     int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=T*D)return;
     int t=i/D, d=i%D;
     const block_q8_0*b=emb+(size_t)toks[t]*(D/32)+d/32;
     H[i]=q36_fp16(b->d)*b->qs[d%32];
 }
-__global__ void k_rmsnorm_b(const float*x,const float*w,float*y,int n,float eps){
+__global__ void k_rmsnorm_b(const float*x,const float*w,float*y,int n,float eps){Q36_GDS();
     int t=blockIdx.x; x+=(size_t)t*n; y+=(size_t)t*n;
     __shared__ float part[32]; __shared__ float ss;
     float loc=0; for(int i=threadIdx.x;i<n;i+=blockDim.x) loc+=x[i]*x[i];
@@ -3164,7 +3239,7 @@ __global__ void k_rmsnorm_b(const float*x,const float*w,float*y,int n,float eps)
     for(int i=threadIdx.x;i<n;i+=blockDim.x) y[i]=x[i]*ss*w[i];
 }
 /* per-head norms with a batch dimension on grid.y and a row stride */
-__global__ void k_head_rmsnorm_b(float*x,const float*w,int head_dim,uint64_t row_stride,float eps){
+__global__ void k_head_rmsnorm_b(float*x,const float*w,int head_dim,uint64_t row_stride,float eps){Q36_GDS();
     float*xh=x+(size_t)blockIdx.y*row_stride+(size_t)blockIdx.x*head_dim;
     __shared__ float ss; if(threadIdx.x==0)ss=0; __syncthreads();
     float loc=0; for(int i=threadIdx.x;i<head_dim;i+=blockDim.x) loc+=xh[i]*xh[i];
@@ -3172,7 +3247,7 @@ __global__ void k_head_rmsnorm_b(float*x,const float*w,int head_dim,uint64_t row
     __syncthreads(); float sc=rsqrtf(ss/head_dim+eps);
     for(int i=threadIdx.x;i<head_dim;i+=blockDim.x) xh[i]=xh[i]*sc*w[i];
 }
-__global__ void k_head_l2norm_b(float*x,int head_dim,uint64_t row_stride,float eps){
+__global__ void k_head_l2norm_b(float*x,int head_dim,uint64_t row_stride,float eps){Q36_GDS();
     float*xh=x+(size_t)blockIdx.y*row_stride+(size_t)blockIdx.x*head_dim;
     __shared__ float ss; if(threadIdx.x==0)ss=0; __syncthreads();
     float loc=0; for(int i=threadIdx.x;i<head_dim;i+=blockDim.x) loc+=xh[i]*xh[i];
@@ -3180,14 +3255,14 @@ __global__ void k_head_l2norm_b(float*x,int head_dim,uint64_t row_stride,float e
     __syncthreads(); float sc=rsqrtf(ss+eps);
     for(int i=threadIdx.x;i<head_dim;i+=blockDim.x) xh[i]=xh[i]*sc;
 }
-__global__ void k_split_qgate_b(const float*Qfull,float*q,float*gate,int T,int n_head,int head_dim){
+__global__ void k_split_qgate_b(const float*Qfull,float*q,float*gate,int T,int n_head,int head_dim){Q36_GDS();
     int i=blockIdx.x*blockDim.x+threadIdx.x, per=n_head*head_dim;
     if(i>=T*per)return;
     int t=i/per, d=i%per, h=d/head_dim, dd=d%head_dim;
     q[i]   =Qfull[(size_t)t*per*2+h*head_dim*2+dd];
     gate[i]=Qfull[(size_t)t*per*2+h*head_dim*2+head_dim+dd];
 }
-__global__ void k_rope_b(float*x,int head_dim,int rot_dim,int pos0,uint64_t row_stride,float base){
+__global__ void k_rope_b(float*x,int head_dim,int rot_dim,int pos0,uint64_t row_stride,float base){Q36_GDS();
     int t=blockIdx.y, h=blockIdx.x, i=threadIdx.x;
     if(i>=rot_dim/2)return;
     float*xh=x+(size_t)t*row_stride+(size_t)h*head_dim;
@@ -3197,7 +3272,7 @@ __global__ void k_rope_b(float*x,int head_dim,int rot_dim,int pos0,uint64_t row_
     xh[i]=a*c-b*s; xh[i+rot_dim/2]=a*s+b*c;
 }
 __global__ void k_kv_append_b(const float*k,const float*v,int8_t*Kc,__half*Ks,
-                              uint8_t*Vc,uint8_t*Vs,int pos0,int T,int kv_dim,int kvq){
+                              uint8_t*Vc,uint8_t*Vs,int pos0,int T,int kv_dim,int kvq){Q36_GDS();
     int warp=(blockIdx.x*blockDim.x+threadIdx.x)>>5, lane=threadIdx.x&31;
     int nb=kv_dim/32;
     if(warp>=T*2*nb)return;
@@ -3235,7 +3310,7 @@ __global__ void k_kv_append_b(const float*k,const float*v,int8_t*Kc,__half*Ks,
  * persistent history.  (The serial-per-channel version looped T tokens in
  * one thread: 0.38ms/layer at T=2048; this is ~30x more parallel.) */
 __global__ void k_dn_conv_pf(const float*in,const float*w,float*hist,float*out,
-                             int T,int convd,int K){
+                             int T,int convd,int K){Q36_GDS();
     size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
     if(i>=(size_t)T*convd)return;
     int t=(int)(i/convd), c=(int)(i%convd);
@@ -3246,7 +3321,7 @@ __global__ void k_dn_conv_pf(const float*in,const float*w,float*hist,float*out,
     out[i]=silu(w[c*4]*x0+w[c*4+1]*x1+w[c*4+2]*x2+w[c*4+3]*x3);
 }
 /* update the 3-deep history from the chunk tail (reads before writes for T<3) */
-__global__ void k_dn_conv_hist(const float*in,float*hist,int T,int convd){
+__global__ void k_dn_conv_hist(const float*in,float*hist,int T,int convd){Q36_GDS();
     int c=blockIdx.x*blockDim.x+threadIdx.x; if(c>=convd)return;
     float h[3];
     #pragma unroll
@@ -3257,7 +3332,7 @@ __global__ void k_dn_conv_hist(const float*in,float*hist,int T,int convd){
 }
 /* chunk scan: state column stays in registers across all T tokens */
 __global__ void k_dn_scan_pf(const float*CB,const float*G,const float*B,float*S,float*O,
-                             int T,int nvh,int nkh,int hkd,int hvd,int convd,int voff){
+                             int T,int nvh,int nkh,int hkd,int hvd,int convd,int voff){Q36_GDS();
     /* sync-free: warps read q/k straight through L1 (all warps of a head hit
      * the same cache lines), eliminating 2 block syncs per token.
      * Dead end (measured): 4 j-columns per warp to amortize q/k loads --
@@ -3296,7 +3371,7 @@ __global__ void k_dn_scan_pf(const float*CB,const float*G,const float*B,float*S,
 /* fixed-order partials, not atomicAdd: 4-warp float atomics made the prefill
  * nondeterministic at the ulp level (greedy streams flipped at near-ties
  * between runs); same fix as the decode k_dn_gnorm. */
-__global__ void k_dn_gnorm_b(float*out,const float*gain,const float*z,int hvd,uint64_t row_stride,float eps){
+__global__ void k_dn_gnorm_b(float*out,const float*gain,const float*z,int hvd,uint64_t row_stride,float eps){Q36_GDS();
     int t=blockIdx.y, h=blockIdx.x;
     float*oh=out+(size_t)t*row_stride+(size_t)h*hvd;
     const float*zh=z+(size_t)t*row_stride+(size_t)h*hvd;
@@ -3309,14 +3384,14 @@ __global__ void k_dn_gnorm_b(float*out,const float*gain,const float*z,int hvd,ui
     __syncthreads(); float sc=rsqrtf(ss/hvd+eps);
     for(int i=threadIdx.x;i<hvd;i+=blockDim.x) oh[i]=oh[i]*sc*gain[i]*silu(zh[i]);
 }
-__global__ void k_moe_dispatch(const int*topk,int*ecount,int*elist,int T,int nslots,int cap){
+__global__ void k_moe_dispatch(const int*topk,int*ecount,int*elist,int T,int nslots,int cap){Q36_GDS();
     int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=T*nslots)return;
     int e2=topk[i];
     int p=atomicAdd(&ecount[e2],1);
     elist[(size_t)e2*cap+p]=i;   /* entry = t*8+s */
 }
 __global__ void k_moe_combine_pf(float*moe,const float*DN,const float*w,
-                                 const float*SH,const float*shg,int D,int nslots,int inc_sh){
+                                 const float*SH,const float*shg,int D,int nslots,int inc_sh){Q36_GDS();
     int t=blockIdx.y, i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=D)return;
     float acc=0;
     for(int s=0;s<nslots;s++) acc+=w[(size_t)t*nslots+s]*DN[((size_t)t*nslots+s)*D+i];
@@ -3539,7 +3614,7 @@ static void q36_decode_body_bt(q36_engine*e,int B){
 
 /* batched residual-add + rmsnorm: one block per token; identical reduction
  * structure to k_add_rmsnorm so per-token results are bit-identical. */
-__global__ void k_add_rmsnorm_b(float*h,const float*a,const float*w,float*y,int n,float eps){
+__global__ void k_add_rmsnorm_b(float*h,const float*a,const float*w,float*y,int n,float eps){Q36_GDS();
     int t=blockIdx.x;
     h+=(size_t)t*n; a+=(size_t)t*n; y+=(size_t)t*n;
     __shared__ float part[32]; __shared__ float ss;
@@ -3555,7 +3630,7 @@ __global__ void k_add_rmsnorm_b(float*h,const float*a,const float*w,float*y,int 
 /* rope with a per-token DEVICE position (grid.y = token); same per-element
  * math as k_rope_p. */
 __global__ void k_rope_pb(float*x,uint64_t row_stride,int head_dim,int rot_dim,
-                          const int*posp,float base){
+                          const int*posp,float base){Q36_GDS();
     int t=blockIdx.y, h=blockIdx.x, i=threadIdx.x; if(i>=rot_dim/2)return;
     float*xh=x+(size_t)t*row_stride+(size_t)h*head_dim;
     float inv=__powf(base,-2.0f*i/rot_dim), ang=(float)posp[t]*inv;
@@ -3567,7 +3642,7 @@ __global__ void k_rope_pb(float*x,uint64_t row_stride,int head_dim,int rot_dim,
  * body identical to k_kv_append. */
 __global__ void k_kv_append2(const float*k,uint64_t kstride,const float*v,uint64_t vstride,
                              int8_t*Kc,__half*Ks,uint8_t*Vc,uint8_t*Vs,
-                             const int*posp,int kv_dim,int kvq){
+                             const int*posp,int kv_dim,int kvq){Q36_GDS();
     int t=blockIdx.y;
     k+=(size_t)t*kstride; v+=(size_t)t*vstride;
     int warp=(blockIdx.x*blockDim.x+threadIdx.x)>>5, lane=threadIdx.x&31;
@@ -3906,11 +3981,13 @@ extern "C" int q36_engine_step_mtp(q36_engine*e,int token,int pos,int out[Q36_MT
                 q36_mtp_body(e,k?e->mtp_z:e->mtp_h,k,k,capm,1);
             q36_verify_body(e,B,caps);
             CK(cudaStreamEndCapture(cudaStreamPerThread,&g));
+            if(!getenv("Q36_NOPDL")) pdl_edges(g);
             CK(cudaGraphInstantiate(&e->gx_v,g,0)); cudaGraphDestroy(g);
             /* fill-only graph: true-h entry, no head (mm pair 3) */
             CK(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeGlobal));
             q36_mtp_body(e,e->mtp_h,0,3,capm,0);
             CK(cudaStreamEndCapture(cudaStreamPerThread,&g));
+            if(!getenv("Q36_NOPDL")) pdl_edges(g);
             CK(cudaGraphInstantiate(&e->gx_mn,g,0)); cudaGraphDestroy(g);
         }
         static int prof=-1; if(prof<0) prof=getenv("Q36_MTP_PROF")?1:0;
@@ -4081,7 +4158,7 @@ extern "C" double q36_engine_fake_batch(q36_engine*e,int B,int c0,int reps){
 }
 
 /* streaming logsumexp over one logits row + target pick -> NLL (one block) */
-__global__ void k_nll_one(const float*logits,int n,int target,float*out){
+__global__ void k_nll_one(const float*logits,int n,int target,float*out){Q36_GDS();
     int tid=threadIdx.x;
     float m=-1e30f,s=0.f;
     for(int i=tid;i<n;i+=blockDim.x){

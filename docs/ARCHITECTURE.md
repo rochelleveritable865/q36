@@ -40,7 +40,7 @@ this without changing the bytes (deeper quantization, speculation);
 well-optimized kernels on real workloads typically sustain ~65% of peak
 bandwidth, i.e. a realistic ceiling around 426 t/s.
 
-q36 measures **272 t/s** — 41% of the absolute roofline, 64% of the
+q36 measures **294 t/s** — 45% of the absolute roofline, 69% of the
 realistic one. The decode path that achieves this:
 
 - **One captured CUDA graph per token.** The entire 40-block forward
@@ -51,6 +51,12 @@ realistic one. The decode path that achieves this:
   the GPU inside the generation loop.
 - **On-device sampling.** Temperature/top-k/top-p run as kernels, so
   sampled generation keeps the same zero-sync property as greedy.
+- **Programmatic Dependent Launch on every graph edge.** The ~900
+  kernel-to-kernel handoffs per token are rewritten as programmatic
+  edges after capture, letting each grid's setup overlap its
+  predecessor's drain (each kernel opens with a grid dependency sync, so
+  memory ordering is unchanged). Worth +2.4–3.7% by itself — small
+  kernels' exposed launch latency was pure dead time.
 
 The roofline also explains why this repository's larger wins are in
 *prefill* (see §2): decode can only close the remaining gap to the

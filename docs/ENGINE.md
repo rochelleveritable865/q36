@@ -7,7 +7,8 @@ goal is not generality — it is to test one hypothesis:
 > **Can a model-specific engine beat generic engines (llama.cpp/vLLM/SGLang)
 > by specializing to this exact architecture, quant format, and one GPU?**
 
-**Answer so far: yes, at every measured point** (see benchmarks below).
+**Answer so far: yes — every end-to-end workload and every prefill/decode
+point except decode at 90k depth** (see benchmarks below).
 
 Target hardware: **RTX 5090 (32 GB) / RTX 6000 Pro (96 GB), sm_120a (Blackwell)**, CUDA 13.1 (tested; earlier 12.x with sm_120a support is untested). (Note: While architecturally compatible with the RTX 6000 Pro Blackwell, the engine has not yet been physically tested on it.)
 No cuBLAS, no cuDNN, no frameworks: the quant formats live *inside* the
@@ -17,28 +18,61 @@ hybrid-state caching), see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Benchmarks (q36_bench, greedy, 1 GPU, fp16 KV)
 
-| test | q36 v0.4.0 | llama.cpp `-fa 1` (b9954) |
+| test | q36 | llama.cpp `-fa 1` (b9954, best `-b/-ub`) |
 |---|---:|---:|
-| pp2048 | **13,462 t/s** | 9,419 |
-| pp8192 | **12,416** | 8,778 |
-| pp32768 | **10,488** | 8,186 |
-| pp90112 | **7,668** | 6,342 |
-| tg128 | 272.3 (276.6*) | **279.6** |
-| tg128 @ d32768 | 234.2 (237.2*) | **247.4** |
-| tg128 @ d90112 | 187.5 (190.1*) | **208.1** |
+| pp2048 | **13,665 t/s** | 10,836 |
+| pp8192 | **12,615** | 10,596 |
+| pp32768 | **10,665** | 9,400 |
+| pp90112 | **7,843** | 7,112 |
+| tg128 | **294.4** | 280.5 |
+| tg128 @ d32768 | **251.5** | 246.2 |
+| tg128 @ d90112 | 199.5 | **208.3** |
 
-\* with the opt-in mixed-precision head (`Q36_MIX_HEAD=32768`, ppl +0.24%).
-Prefill leads at every point (+21% to +43%); pure decode trails by 1-9%.
-End-to-end (prompt + generation together) q36 wins every realistic
-workload: 8k+500tok +8%, 32k+300tok +15%, 90k+2000tok +6%, short chat tie
--- before counting the server prefix cache on multi-turn.  Both columns
-measured back-to-back on the same idle 5090 (clocked at a 400W power limit), single GPU, identical GGUF,
-`llama-bench` vs `q36_bench` with matched pp/tg/depths.
+```
+prefill t/s                                       q36 ▓   llama.cpp ░
+pp2048    ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  13,665
+          ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  10,836
+pp8192    ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  12,615
+          ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  10,596
+pp32768   ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  10,665
+          ░░░░░░░░░░░░░░░░░░░░░░░░░░░  9,400
+pp90112   ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  7,843
+          ░░░░░░░░░░░░░░░░░░░░  7,112
+
+decode t/s at depth
+tg128     ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  294.4
+          ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  280.5
+@ d32768  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  251.5
+          ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  246.2
+@ d90112  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  199.5
+          ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  208.3
+```
+
+Prefill leads at every point (+10% to +26%); decode leads flat (+5.0%)
+and at 32k depth (+2.2%), and trails by 4% at 90k. The opt-in
+mixed-precision head (`Q36_MIX_HEAD=32768`) adds a further ~+1.7% decode
+for +0.24% ppl.
+End-to-end (prompt + generation together) q36 wins every measured
+workload: short chat (2k+200tok) +9%, 8k+500tok +9%, 32k+300tok +10%,
+90k+2000tok +4% -- before counting the server prefix cache on
+multi-turn. Both columns measured back-to-back on the same idle 5090
+(clocked at a 400W power limit), single GPU, identical GGUF.
 
 `pp` = prompt processing (prefill), `tg` = token generation at a context
-depth. Reproduce with `./q36_bench -p 2048,16384,32768,90112 -n 128
--d 0,32768,90112 -r 3`. Model loads in ~5.5s warm; ~26 GB VRAM resident;
-90k-context retrieval quality verified in both KV modes.
+depth. Exact commands (2026-07-13):
+
+```sh
+./q36_bench -m <model.gguf> -p 2048,8192,32768,90112 -n 128 -d 0,32768,90112 -r 3
+
+llama-bench -m <model.gguf> -fa 1 -p 2048,8192,32768,90112 -n 0 -b 2048 -ub 512,1024,2048 -r 3
+llama-bench -m <model.gguf> -fa 1 -p 0 -n 128 -d 0,32768,90112 -r 3
+```
+
+The llama.cpp prefill column takes its best result per row across the
+`-ub` sweep (`-ub 2048` at 8k/32k, `-ub 1024` at 2k/90k; `-b 1024 -ub
+1024` was also measured and never best; decode is batch-1 and
+insensitive to `-b/-ub`). Model loads in ~5.5s warm; ~26 GB VRAM
+resident; 90k-context retrieval quality verified in both KV modes.
 
 ## What this model actually is (verified from the GGUF)
 
@@ -207,6 +241,7 @@ nothing measurable; kv-quant costs +0.54%.  Full run ~110s = release gate.
   are hardware-calibrated via the `test_mma_bs` harness.
 - Multi-GPU expert parallelism works but is a net loss on GeForce (no P2P);
   the `--gpus N` path is kept for P2P-capable hardware.
-- Env toggles: `Q36_DEBUG`, `Q36_NOGRAPH`, `Q36_MEGA`, `Q36_NOFORK`,
+- Env toggles: `Q36_DEBUG`, `Q36_NOGRAPH`, `Q36_NOPDL` (disable
+  programmatic dependent launch in the decode graph), `Q36_MEGA`, `Q36_NOFORK`,
   `Q36_RSTAT`, `Q36_ENCTEST`, `Q36_PF2` (pre-tensor-core prefill attention
   fallback for A/B).
